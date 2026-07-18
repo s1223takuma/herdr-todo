@@ -1,0 +1,10 @@
+id = "local.herdr-todo-auto-open"
+name = "Local Herdr TODO Auto Open"
+version = "0.1.0"
+description = "Open herdr-todo automatically in newly created local workspaces"
+min_herdr_version = "0.7.0"
+platforms = ["macos", "linux"]
+
+[[events]]
+on = "workspace.created"
+command = ["sh", "auto-open.sh"]

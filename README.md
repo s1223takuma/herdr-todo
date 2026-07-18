@@ -18,6 +18,8 @@ Herdrのワークスペース内でMarkdown形式のTODOを管理するターミ
 - 親子関係を持つ階層TODO
 - `P1`〜`P3`の優先度
 - 優先度→期限が近い順のソート（期限なしは同じ優先度内の末尾）
+- TODOごとのカテゴリと、カテゴリ内の最高優先度によるグループ化
+- `u`による直前の変更のUndo（Local / Global別、最大100件）
 - 期限の設定と期限切れの赤色表示
 - 期限が今日または明日のTODOを黄色の太字で警告
 - 期限から7日経過したTODOの自動削除と`SAVE`保護
@@ -93,12 +95,28 @@ herdr server reload-config
 > [!IMPORTANT]
 > `type = "shell"`で`herdr plugin pane open`を直接実行しないでください。プラグインアクションを迂回するため、`prefix+t`を押したペインのcwdが引き継がれません。
 
+### 新しいワークスペースで自動起動する（ローカル設定）
+
+このリポジトリの`local-plugin`は、配布用プラグインとは独立したローカル補助プラグインです。リンクすると、新しく作成した各ワークスペースの右側にTODOペインを1つだけ自動で開きます。
+
+```sh
+herdr plugin link ./local-plugin
+```
+
+無効化・削除する場合（ファイル自体は削除されません）：
+
+```sh
+herdr plugin unlink local.herdr-todo-auto-open
+```
+
 ## 操作方法
 
 | キー                 | 操作                                      |
 | -------------------- | ----------------------------------------- |
 | `Tab`                | Local / Globalの操作対象を切り替え        |
 | `j` / `k`, `↓` / `↑` | TODOを移動                                |
+| `Shift+J` / `Shift+K` | 選択TODOを子TODOごと下／上へ並べ替え      |
+| `gg` / `G`           | 先頭 / 末尾のTODOへ移動                 |
 | `Space`, `Enter`     | 完了状態を切り替え                        |
 | `a`                  | TODOを追加                                |
 | `e`                  | TODOの本文を編集                          |
@@ -108,12 +126,16 @@ herdr server reload-config
 | `Shift+C`            | 存在しない場合のみLocal `TODO.md`を作成   |
 | `>` / `→`            | 選択中のTODOを子階層にする                |
 | `<` / `←`            | 選択中のTODOを親階層へ戻す                |
+| `l` / `h`            | Vimライクに子階層 / 親階層へ変更      |
 | `p`                  | 優先度を切り替え（未設定 → P1 → P2 → P3） |
 | `s`                  | 同じ階層内を優先度→期限が近い順に並べ替え |
+| `c`                  | カテゴリを設定・変更（空欄で解除）        |
+| `f`                  | カテゴリ別にまとめ、最高優先度順に並べ替え |
 | `t`                  | 期限を`YYYY-MM-DD`形式で設定              |
+| `u`                  | 直前の変更を元に戻す                      |
 | `r`                  | Markdownファイルを再読み込み              |
 | `?`                  | ヘルプを表示                              |
-| `q`, `Esc`           | 終了                                      |
+| `Cmd+Shift+Q`        | 終了（通常の`q` / `Esc`では閉じません）   |
 
 TODOの追加・編集はポップアップで行います。`Shift+Enter`または`Alt+Enter`で改行し、`Enter`で保存します。
 
@@ -155,13 +177,17 @@ export HERDR_TODO_GLOBAL_PATH="$HOME/Documents/TODO.md"
 ```md
 # TODO
 
-- [ ] [P1] [SAVE] 今日中に対応 📅 2026-07-18
+- [ ] [P1] [SAVE] [CAT:仕事] 今日中に対応 📅 2026-07-18
       複数行の説明も保存できます
   - [x] [P2] 子タスク
 - [ ] 通常のタスク
 ```
 
-優先度や期限が付いていない通常のMarkdownチェックリストも読み込めます。
+優先度や期限が付いていない通常のMarkdownチェックリストも読み込めます。Markdownの見出し・通常文・引用もTODOと同じ一覧に表示します。Markdown表は列幅を揃えた罫線付きの表として表示し、TODOの編集後も元の行を保持します。
+
+カテゴリは`[CAT:カテゴリ名]`として保存されます。`f`を押すと同じ親を持つTODOをカテゴリ別にまとめ、各カテゴリ内で最も高い優先度を基準にカテゴリを並べます。カテゴリなしは末尾です。カテゴリ内の現在の順序と親子構造は維持されます。
+
+Undo履歴は起動中のメモリにLocal / Global別で最大100件保持されます。`r`でMarkdownを再読み込みした場合や、追従元ペインのcwdが変わった場合、そのファイルの履歴はリセットされます。
 
 ### 期限と自動削除
 
@@ -256,6 +282,8 @@ It displays and edits both a Local TODO file for the current project and a Globa
 - Due dates with overdue tasks shown in bold red
 - Tasks due today or tomorrow shown in bold yellow
 - Automatic removal of tasks seven days after their due date, with optional `SAVE` protection
+- Per-task categories grouped by the highest priority in each category
+- Up to 100 in-memory undo entries per Local and Global document
 - Bulk deletion of completed tasks
 - Multiline popup input
 - Display-width-aware wrapping for long text and Japanese characters
@@ -328,12 +356,28 @@ Herdr TODO continues monitoring the source pane after opening. If you run `cd` i
 > [!IMPORTANT]
 > Do not invoke `herdr plugin pane open` directly from a `type = "shell"` binding. That bypasses the plugin action, so the cwd of the pane in which you pressed `prefix+t` is not preserved.
 
+### Auto-open in new workspaces (local setting)
+
+The `local-plugin` directory is a local helper separate from the distributed plugin. Once linked, it automatically opens one TODO pane on the right of each newly created workspace.
+
+```sh
+herdr plugin link ./local-plugin
+```
+
+To disable and unlink it without deleting its files:
+
+```sh
+herdr plugin unlink local.herdr-todo-auto-open
+```
+
 ## Key bindings
 
 | Key | Action |
 | --- | --- |
 | `Tab` | Switch the active section between Local and Global |
 | `j` / `k`, `↓` / `↑` | Move between TODOs |
+| `Shift+J` / `Shift+K` | Move the selected TODO and its children down/up |
+| `gg` / `G` | Move to the first / last TODO |
 | `Space`, `Enter` | Toggle completion |
 | `a` | Add a TODO |
 | `e` | Edit TODO text |
@@ -343,12 +387,16 @@ Herdr TODO continues monitoring the source pane after opening. If you run `cd` i
 | `Shift+C` | Create the Local `TODO.md`, only when it does not exist |
 | `>` / `→` | Indent the selected TODO into a child level |
 | `<` / `←` | Move the selected TODO toward the root level |
+| `l` / `h` | Vim-like indent / outdent |
 | `p` | Cycle priority: unset → P1 → P2 → P3 |
 | `s` | Sort siblings by priority, then nearest due date |
+| `c` | Set or change the category; submit an empty value to clear it |
+| `f` | Group categories by the highest priority in each category |
 | `t` | Set a due date in `YYYY-MM-DD` format |
+| `u` | Undo the last change |
 | `r` | Reload the Markdown file |
 | `?` | Show help |
-| `q`, `Esc` | Quit |
+| `Cmd+Shift+Q` | Quit (`q` and `Esc` do not close the pane) |
 
 Adding and editing TODOs uses a popup. Press `Shift+Enter` or `Alt+Enter` to insert a newline, `Enter` to save, and `Esc` to cancel.
 
@@ -390,13 +438,17 @@ Example Markdown:
 ```md
 # TODO
 
-- [ ] [P1] [SAVE] Finish today 📅 2026-07-18
+- [ ] [P1] [SAVE] [CAT:Work] Finish today 📅 2026-07-18
       Multiline descriptions are supported
   - [x] [P2] Child task
 - [ ] Regular task
 ```
 
 Standard Markdown task lists without priorities or due dates are also supported.
+
+Categories are stored as `[CAT:Category]`. Press `f` to group siblings by category and order categories by the highest-priority TODO they contain. Uncategorized TODOs are placed last. Existing order within each category and parent-child relationships are preserved.
+
+Undo history is kept in memory, separately for Local and Global documents, with a maximum of 100 entries each. Reloading with `r` or changing the tracked source-pane cwd resets the history for that file.
 
 ### Due dates and automatic removal
 
