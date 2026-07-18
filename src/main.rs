@@ -2,6 +2,7 @@ use std::{
     env, fs,
     io::{self, stdout},
     path::{Path, PathBuf},
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -100,6 +101,8 @@ struct App {
     message_until: Option<Instant>,
     input: String,
     input_mode: InputMode,
+    source_pane_id: Option<String>,
+    last_cwd_check: Instant,
 }
 
 impl App {
@@ -120,6 +123,8 @@ impl App {
             message_until: None,
             input: String::new(),
             input_mode: InputMode::Normal,
+            source_pane_id: env::var("HERDR_TODO_SOURCE_PANE_ID").ok(),
+            last_cwd_check: Instant::now(),
         })
     }
 
@@ -445,6 +450,59 @@ impl App {
             self.message_until = None;
         }
     }
+
+    fn update_local_cwd(&mut self) -> Result<()> {
+        if self.input_mode != InputMode::Normal
+            || self.last_cwd_check.elapsed() < Duration::from_secs(1)
+        {
+            return Ok(());
+        }
+        self.last_cwd_check = Instant::now();
+        let Some(source_pane_id) = self.source_pane_id.as_deref() else {
+            return Ok(());
+        };
+        let herdr = env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+        let Ok(output) = Command::new(herdr)
+            .args(["pane", "process-info", "--pane", source_pane_id])
+            .output()
+        else {
+            return Ok(());
+        };
+        if !output.status.success() {
+            return Ok(());
+        }
+        let Some(cwd) = parse_foreground_cwd(&output.stdout) else {
+            return Ok(());
+        };
+        let new_path = cwd.join("TODO.md");
+        if new_path == self.local_path {
+            return Ok(());
+        }
+        let todos = load_todos(&new_path)?;
+        self.local_path = new_path;
+        if self.scope == Scope::Local {
+            self.todos = todos;
+            self.selected = self.selected.min(self.todos.len().saturating_sub(1));
+        } else {
+            self.other_todos = todos;
+            self.other_selected = self
+                .other_selected
+                .min(self.other_todos.len().saturating_sub(1));
+        }
+        self.set_message(
+            format!("Local TODO changed to {}", cwd.display()),
+            MessageKind::Success,
+        );
+        Ok(())
+    }
+}
+
+fn parse_foreground_cwd(output: &[u8]) -> Option<PathBuf> {
+    serde_json::from_slice::<serde_json::Value>(output)
+        .ok()?
+        .pointer("/result/process_info/foreground_processes/0/cwd")?
+        .as_str()
+        .map(PathBuf::from)
 }
 
 fn ensure_todo_file(path: &Path) -> Result<()> {
@@ -692,7 +750,7 @@ fn render_todo_list(
     let availability = if path.exists() {
         ""
     } else {
-        " [not created: Shift+C]"
+        " [TODO.md not found. Create it with Shift+C]"
     };
     let border_style = Style::default().fg(if active { Color::Cyan } else { Color::DarkGray });
     let list = List::new(items)
@@ -938,6 +996,7 @@ fn handle_input_mode(app: &mut App, key: KeyEvent) -> Result<()> {
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
         app.update_message_timeout();
+        app.update_local_cwd()?;
         terminal.draw(|frame| draw(frame, app))?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -1165,6 +1224,16 @@ mod tests {
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::CROSSED_OUT)
+        );
+    }
+
+    #[test]
+    fn parses_source_pane_foreground_cwd() {
+        let output =
+            br#"{"result":{"process_info":{"foreground_processes":[{"cwd":"/tmp/project"}]}}}"#;
+        assert_eq!(
+            parse_foreground_cwd(output),
+            Some(PathBuf::from("/tmp/project"))
         );
     }
 }

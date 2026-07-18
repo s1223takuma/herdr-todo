@@ -19,6 +19,7 @@ set -- herdr plugin pane open \
 
 if [ -n "${HERDR_PANE_ID:-}" ]; then
     set -- "$@" --target-pane "$HERDR_PANE_ID"
+    set -- "$@" --env "HERDR_TODO_SOURCE_PANE_ID=$HERDR_PANE_ID"
 fi
 
 exec "$@"
