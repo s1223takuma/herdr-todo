@@ -1,0 +1,30 @@
+id = "herdr-todo"
+name = "Herdr TODO"
+version = "0.1.0"
+description = "Interactive Markdown TODO viewer for Herdr"
+min_herdr_version = "0.7.0"
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "todo"
+title = "TODO"
+placement = "popup"
+width = "55%"
+height = "70%"
+command = ["herdr-todo"]
+
+[[actions]]
+id = "open"
+title = "Open TODO"
+command = [
+  "herdr",
+  "plugin",
+  "pane",
+  "open",
+  "todo",
+  "--plugin",
+  "herdr-todo"
+]
+
+[[build]]
+command = ["cargo", "build", "--release"]
