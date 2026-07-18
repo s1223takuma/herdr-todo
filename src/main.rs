@@ -78,6 +78,13 @@ struct DocumentRef<'a> {
     markdown: &'a [MarkdownLine],
 }
 
+#[derive(Clone, Copy)]
+struct TodoListView<'a> {
+    selected: usize,
+    active: bool,
+    search_query: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scope {
     Local,
@@ -193,6 +200,22 @@ impl App {
         }
     }
 
+    fn normalize_selection(&mut self) {
+        if self.todos.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        if self.selected >= self.todos.len()
+            || !todo_matches_search(&self.todos[self.selected], self.search_query.as_deref())
+        {
+            self.selected = self
+                .todos
+                .iter()
+                .position(|todo| todo_matches_search(todo, self.search_query.as_deref()))
+                .unwrap_or(0);
+        }
+    }
+
     fn reorder_selected(&mut self, down: bool) -> Result<()> {
         let Some(new_selected) = reorder_todo_block(&mut self.todos, self.selected, down) else {
             self.set_message("No sibling TODO in that direction", MessageKind::Warning);
@@ -269,7 +292,9 @@ impl App {
     fn start_search(&mut self) {
         self.input = self.search_query.clone().unwrap_or_default();
         self.input_mode = InputMode::Search;
-        self.set_persistent_message("Search text/category: Enter to apply, empty to clear, Esc to cancel");
+        self.set_persistent_message(
+            "Search text/category: Enter to apply, empty to clear, Esc to cancel",
+        );
     }
 
     fn start_due(&mut self) {
@@ -382,15 +407,26 @@ impl App {
             }
             InputMode::Search => {
                 self.search_query = (!text.is_empty()).then_some(text);
-                if !self.todos.get(self.selected).is_some_and(|todo| {
-                    todo_matches_search(todo, self.search_query.as_deref())
-                }) {
+                if !self
+                    .todos
+                    .get(self.selected)
+                    .is_some_and(|todo| todo_matches_search(todo, self.search_query.as_deref()))
+                {
                     self.selected = self
                         .todos
                         .iter()
                         .position(|todo| todo_matches_search(todo, self.search_query.as_deref()))
                         .unwrap_or(0);
                 }
+                self.input.clear();
+                self.input_mode = InputMode::Normal;
+                let message = self
+                    .search_query
+                    .as_ref()
+                    .map(|query| format!("Search applied: {query}"))
+                    .unwrap_or_else(|| "Search cleared".to_string());
+                self.set_message(message, MessageKind::Success);
+                return Ok(());
             }
             _ => return Ok(()),
         }
@@ -524,7 +560,7 @@ impl App {
         };
         self.todos = previous;
         self.last_saved_todos = self.todos.clone();
-        self.selected = self.selected.min(self.todos.len().saturating_sub(1));
+        self.normalize_selection();
         save_document(self.path(), &self.todos, &self.markdown)?;
         self.set_message("Undid last change", MessageKind::Success);
         Ok(())
@@ -542,11 +578,12 @@ impl App {
         self.markdown = markdown;
         self.last_saved_todos = self.todos.clone();
         self.undo_stack.clear();
-        self.selected = self.selected.min(self.todos.len().saturating_sub(1));
+        self.normalize_selection();
         Ok(())
     }
 
     fn save(&mut self) -> Result<()> {
+        self.normalize_selection();
         if self.todos != self.last_saved_todos {
             self.undo_stack.push(self.last_saved_todos.clone());
             if self.undo_stack.len() > 100 {
@@ -1082,15 +1119,31 @@ fn todo_style(todo: &Todo, today: NaiveDate) -> Style {
     Style::default()
 }
 
+fn todo_matches_search(todo: &Todo, query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return true;
+    };
+    let query = query.to_lowercase();
+    todo.text.to_lowercase().contains(&query)
+        || todo
+            .category
+            .as_ref()
+            .is_some_and(|category| category.to_lowercase().contains(&query))
+}
+
 fn render_todo_list(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     name: &str,
     path: &Path,
     document: DocumentRef<'_>,
-    selected: usize,
-    active: bool,
+    view: TodoListView<'_>,
 ) {
+    let TodoListView {
+        selected,
+        active,
+        search_query,
+    } = view;
     let todos = document.todos;
     let markdown = document.markdown;
     let available_width = area.width.saturating_sub(6).max(1) as usize;
@@ -1098,10 +1151,14 @@ fn render_todo_list(
     let mut items = Vec::new();
     let mut selected_row = 0;
     for index in 0..=todos.len() {
-        let markdown_lines: Vec<_> = markdown
-            .iter()
-            .filter(|line| line.before_todo.min(todos.len()) == index)
-            .collect();
+        let markdown_lines: Vec<_> = if search_query.is_none() {
+            markdown
+                .iter()
+                .filter(|line| line.before_todo.min(todos.len()) == index)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut markdown_index = 0;
         while markdown_index < markdown_lines.len() {
             if markdown_index + 1 < markdown_lines.len()
@@ -1154,7 +1211,10 @@ fn render_todo_list(
         if index == selected {
             selected_row = items.len();
         }
-        if let Some(todo) = todos.get(index) {
+        if let Some(todo) = todos
+            .get(index)
+            .filter(|todo| todo_matches_search(todo, search_query))
+        {
             let mark = if todo.checked { "☑" } else { "☐" };
             let hierarchy = if todo.depth == 0 {
                 String::new()
@@ -1188,11 +1248,20 @@ fn render_todo_list(
         " [TODO.md not found. Create it with Shift+C]"
     };
     let border_style = Style::default().fg(if active { Color::Cyan } else { Color::DarkGray });
+    let search = search_query
+        .map(|query| {
+            let matches = todos
+                .iter()
+                .filter(|todo| todo_matches_search(todo, Some(query)))
+                .count();
+            format!(" [/{query}: {matches}]")
+        })
+        .unwrap_or_default();
     let list = List::new(items)
         .block(
             Block::default()
                 .title(format!(
-                    " {marker} {name} TODO{availability} ({}) ",
+                    " {marker} {name} TODO{availability}{search} ({}) ",
                     path.display()
                 ))
                 .borders(Borders::ALL)
@@ -1291,8 +1360,15 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             todos: local_todos,
             markdown: local_markdown,
         },
-        local_selected,
-        app.scope == Scope::Local,
+        TodoListView {
+            selected: local_selected,
+            active: app.scope == Scope::Local,
+            search_query: if app.scope == Scope::Local {
+                app.search_query.as_deref()
+            } else {
+                app.other_search_query.as_deref()
+            },
+        },
     );
     render_todo_list(
         frame,
@@ -1303,8 +1379,15 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             todos: global_todos,
             markdown: global_markdown,
         },
-        global_selected,
-        app.scope == Scope::Global,
+        TodoListView {
+            selected: global_selected,
+            active: app.scope == Scope::Global,
+            search_query: if app.scope == Scope::Global {
+                app.search_query.as_deref()
+            } else {
+                app.other_search_query.as_deref()
+            },
+        },
     );
 
     let input_title = match app.input_mode {
@@ -1312,6 +1395,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         InputMode::Edit => " Edit TODO ",
         InputMode::Due => " Due date ",
         InputMode::Category => " Category (empty: clear) ",
+        InputMode::Search => " Search text/category (empty: clear) ",
         InputMode::ConfirmDelete => " Delete confirmation ",
         InputMode::ConfirmBulkDelete => " Bulk delete confirmation ",
         _ => " Input ",
@@ -1345,7 +1429,10 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         areas[3],
     );
 
-    if matches!(app.input_mode, InputMode::Due | InputMode::Category) {
+    if matches!(
+        app.input_mode,
+        InputMode::Due | InputMode::Category | InputMode::Search
+    ) {
         let inner_width = areas[2].width.saturating_sub(2).max(1);
         let cursor_width = app.input.as_str().width() as u16;
         frame.set_cursor_position((
@@ -1396,7 +1483,8 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Line::from(vec![Span::raw(
                 "Tab switch  j/k select  J/K reorder  Space toggle  a/e/d edit  u undo",
             )]),
-            Line::from("c category  f group category  p priority  s sort  t due  S save  C create"),
+            Line::from("/ search text/category  c category  f group category  u undo"),
+            Line::from("p priority  s sort  t due  S save  C create"),
             Line::from("h/l or </> outdent/indent  gg/G first/last"),
             Line::from("Priority: P1 high, P2 medium, P3 low, -- unset"),
             Line::from("Cmd+Shift+Q quit (q/Esc stay open)"),
@@ -1423,7 +1511,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<bool> {
     if app.pending_g {
         app.pending_g = false;
         if key.code == KeyCode::Char('g') {
-            app.selected = 0;
+            app.selected = app
+                .todos
+                .iter()
+                .position(|todo| todo_matches_search(todo, app.search_query.as_deref()))
+                .unwrap_or(0);
             return Ok(false);
         }
     }
@@ -1434,7 +1526,13 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::Char('J') => app.reorder_selected(true)?,
         KeyCode::Char('K') => app.reorder_selected(false)?,
         KeyCode::Char('g') => app.pending_g = true,
-        KeyCode::Char('G') => app.selected = app.todos.len().saturating_sub(1),
+        KeyCode::Char('G') => {
+            app.selected = app
+                .todos
+                .iter()
+                .rposition(|todo| todo_matches_search(todo, app.search_query.as_deref()))
+                .unwrap_or(0)
+        }
         KeyCode::Char(' ') | KeyCode::Enter => app.toggle_selected()?,
         KeyCode::Char('a') => app.start_add(),
         KeyCode::Char('e') => app.start_edit(),
@@ -1448,6 +1546,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::Char('f') => app.group_by_category()?,
         KeyCode::Char('t') => app.start_due(),
         KeyCode::Char('u') => app.undo()?,
+        KeyCode::Char('/') => app.start_search(),
         KeyCode::Char('l') | KeyCode::Char('>') | KeyCode::Right => app.change_depth(true)?,
         KeyCode::Char('h') | KeyCode::Char('<') | KeyCode::Left => app.change_depth(false)?,
         KeyCode::Tab => app.toggle_scope()?,
@@ -1502,9 +1601,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     return Ok(());
                 }
             }
-            InputMode::Add | InputMode::Edit | InputMode::Due | InputMode::Category => {
-                handle_input_mode(app, key)?
-            }
+            InputMode::Add
+            | InputMode::Edit
+            | InputMode::Due
+            | InputMode::Category
+            | InputMode::Search => handle_input_mode(app, key)?,
             InputMode::ConfirmDelete | InputMode::ConfirmBulkDelete => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if app.input_mode == InputMode::ConfirmDelete {
@@ -1628,6 +1729,24 @@ mod tests {
                 "uncategorized high"
             ]
         );
+    }
+
+    #[test]
+    fn searches_todo_text_and_category_case_insensitively() {
+        let todo = Todo {
+            checked: false,
+            text: "Deploy API".into(),
+            depth: 0,
+            priority: Priority::None,
+            due: None,
+            saved: false,
+            category: Some("仕事".into()),
+        };
+        assert!(todo_matches_search(&todo, Some("api")));
+        assert!(todo_matches_search(&todo, Some("DEPLOY")));
+        assert!(todo_matches_search(&todo, Some("仕事")));
+        assert!(!todo_matches_search(&todo, Some("個人")));
+        assert!(todo_matches_search(&todo, None));
     }
 
     #[test]

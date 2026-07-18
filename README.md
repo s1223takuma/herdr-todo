@@ -19,6 +19,7 @@ Herdrのワークスペース内でMarkdown形式のTODOを管理するターミ
 - `P1`〜`P3`の優先度
 - 優先度→期限が近い順のソート（期限なしは同じ優先度内の末尾）
 - TODOごとのカテゴリと、カテゴリ内の最高優先度によるグループ化
+- TODO本文とカテゴリ名の部分一致検索
 - `u`による直前の変更のUndo（Local / Global別、最大100件）
 - 期限の設定と期限切れの赤色表示
 - 期限が今日または明日のTODOを黄色の太字で警告
@@ -133,6 +134,7 @@ herdr plugin unlink local.herdr-todo-auto-open
 | `f`                  | カテゴリ別にまとめ、最高優先度順に並べ替え |
 | `t`                  | 期限を`YYYY-MM-DD`形式で設定              |
 | `u`                  | 直前の変更を元に戻す                      |
+| `/`                  | TODO本文・カテゴリ名を検索                |
 | `r`                  | Markdownファイルを再読み込み              |
 | `?`                  | ヘルプを表示                              |
 | `Cmd+Shift+Q`        | 終了（通常の`q` / `Esc`では閉じません）   |
@@ -188,6 +190,8 @@ export HERDR_TODO_GLOBAL_PATH="$HOME/Documents/TODO.md"
 カテゴリは`[CAT:カテゴリ名]`として保存されます。`f`を押すと同じ親を持つTODOをカテゴリ別にまとめ、各カテゴリ内で最も高い優先度を基準にカテゴリを並べます。カテゴリなしは末尾です。カテゴリ内の現在の順序と親子構造は維持されます。
 
 Undo履歴は起動中のメモリにLocal / Global別で最大100件保持されます。`r`でMarkdownを再読み込みした場合や、追従元ペインのcwdが変わった場合、そのファイルの履歴はリセットされます。
+
+`/`を押すと、TODO本文とカテゴリ名を部分一致で検索します。英字の大文字・小文字は区別しません。検索中は一致件数がペインタイトルに表示され、`j/k`と`gg/G`は一致したTODO間だけを移動します。空欄で確定すると検索解除、`Esc`では現在の検索条件を維持して入力をキャンセルします。検索条件はLocal / Global別に保持されます。
 
 ### 期限と自動削除
 
@@ -283,6 +287,7 @@ It displays and edits both a Local TODO file for the current project and a Globa
 - Tasks due today or tomorrow shown in bold yellow
 - Automatic removal of tasks seven days after their due date, with optional `SAVE` protection
 - Per-task categories grouped by the highest priority in each category
+- Partial-match search across TODO text and category names
 - Up to 100 in-memory undo entries per Local and Global document
 - Bulk deletion of completed tasks
 - Multiline popup input
@@ -394,6 +399,7 @@ herdr plugin unlink local.herdr-todo-auto-open
 | `f` | Group categories by the highest priority in each category |
 | `t` | Set a due date in `YYYY-MM-DD` format |
 | `u` | Undo the last change |
+| `/` | Search TODO text and category names |
 | `r` | Reload the Markdown file |
 | `?` | Show help |
 | `Cmd+Shift+Q` | Quit (`q` and `Esc` do not close the pane) |
@@ -449,6 +455,8 @@ Standard Markdown task lists without priorities or due dates are also supported.
 Categories are stored as `[CAT:Category]`. Press `f` to group siblings by category and order categories by the highest-priority TODO they contain. Uncategorized TODOs are placed last. Existing order within each category and parent-child relationships are preserved.
 
 Undo history is kept in memory, separately for Local and Global documents, with a maximum of 100 entries each. Reloading with `r` or changing the tracked source-pane cwd resets the history for that file.
+
+Press `/` to search TODO text and category names by partial match. ASCII matching is case-insensitive. The pane title shows the number of matches, and `j/k` plus `gg/G` navigate matching TODOs only. Submit an empty query to clear the search, or press `Esc` to cancel input while keeping the current query. Local and Global queries are stored separately.
 
 ### Due dates and automatic removal
 
