@@ -2,8 +2,12 @@
 name = "herdr-todo"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/s1223takuma/herdr-todo"
 
 [dependencies]
 anyhow = "1.0.103"
 crossterm = "0.29.0"
 ratatui = "0.30.2"
+chrono = "0.4.41"
+unicode-width = "0.2.1"

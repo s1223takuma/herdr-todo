@@ -8,22 +8,20 @@ platforms = ["macos", "linux"]
 [[panes]]
 id = "todo"
 title = "TODO"
-placement = "popup"
-width = "55%"
-height = "70%"
-command = ["herdr-todo"]
+placement = "split"
+command = [
+  "sh",
+  "-c",
+  "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-todo\""
+]
 
 [[actions]]
 id = "open"
 title = "Open TODO"
 command = [
-  "herdr",
-  "plugin",
-  "pane",
-  "open",
-  "todo",
-  "--plugin",
-  "herdr-todo"
+  "sh",
+  "-c",
+  "exec \"$HERDR_PLUGIN_ROOT/scripts/open-todo.sh\""
 ]
 
 [[build]]
