@@ -24,7 +24,8 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const DEFAULT_MESSAGE: &str =
-    "j/k: select  J/K: reorder  h/l: depth  gg/G: first/last  a/e/d: edit  ?: help";
+    "j/k: select  J/K: reorder  h/l: depth  v: descendants  a/e/d: edit  ?: help";
+const MAX_DESCENDANT_DEPTH: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Priority {
@@ -150,15 +151,17 @@ struct App {
     local_root: PathBuf,
     ancestor_candidates: Vec<(PathBuf, bool)>,
     ancestor_selected: usize,
+    descendants_expanded: bool,
 }
 
 impl App {
     fn new(local_path: PathBuf, global_path: PathBuf) -> Result<Self> {
         ensure_todo_file(&global_path)?;
         let local_root = local_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let (todos, markdown) = load_local_view(&local_root, &local_path)?;
+        let descendants_expanded = true;
+        let (todos, markdown) = load_local_view(&local_root, &local_path, descendants_expanded)?;
         let (other_todos, other_markdown) = load_document(&global_path)?;
-        let local_stamp = local_view_stamp(&local_root, &local_path);
+        let local_stamp = local_view_stamp(&local_root, &local_path, descendants_expanded);
         let global_stamp = file_stamp(&global_path);
         Ok(Self {
             last_saved_todos: todos.clone(),
@@ -190,6 +193,7 @@ impl App {
             local_root,
             ancestor_candidates: Vec::new(),
             ancestor_selected: 0,
+            descendants_expanded,
         })
     }
 
@@ -345,6 +349,32 @@ impl App {
         Ok(())
     }
 
+    fn toggle_descendants(&mut self) -> Result<()> {
+        if self.scope != Scope::Local {
+            self.set_message(
+                "Switch to Local before toggling descendants",
+                MessageKind::Warning,
+            );
+            return Ok(());
+        }
+        self.descendants_expanded = !self.descendants_expanded;
+        self.reload_local()?;
+        self.file_stamp = local_view_stamp(
+            &self.local_root,
+            &self.local_path,
+            self.descendants_expanded,
+        );
+        self.set_message(
+            if self.descendants_expanded {
+                "Descendant TODOs expanded (up to 3 levels)"
+            } else {
+                "Descendant TODOs collapsed"
+            },
+            MessageKind::Success,
+        );
+        Ok(())
+    }
+
     fn start_edit(&mut self) {
         let Some(todo) = self.todos.get(self.selected) else {
             self.set_message("No TODO selected", MessageKind::Warning);
@@ -400,8 +430,16 @@ impl App {
             return Ok(());
         }
         ensure_todo_file(&self.local_path)?;
-        let (todos, markdown) = load_local_view(&self.local_root, &self.local_path)?;
-        let stamp = local_view_stamp(&self.local_root, &self.local_path);
+        let (todos, markdown) = load_local_view(
+            &self.local_root,
+            &self.local_path,
+            self.descendants_expanded,
+        )?;
+        let stamp = local_view_stamp(
+            &self.local_root,
+            &self.local_path,
+            self.descendants_expanded,
+        );
         if self.scope == Scope::Local {
             self.todos = todos;
             self.markdown = markdown;
@@ -687,7 +725,11 @@ impl App {
         self.normalize_selection();
         if self.scope == Scope::Local {
             save_local_documents(&self.todos, &self.markdown)?;
-            self.file_stamp = local_view_stamp(&self.local_root, &self.local_path);
+            self.file_stamp = local_view_stamp(
+                &self.local_root,
+                &self.local_path,
+                self.descendants_expanded,
+            );
         } else {
             save_document(self.path(), &self.todos, &self.markdown)?;
             self.file_stamp = file_stamp(self.path());
@@ -712,7 +754,11 @@ impl App {
         self.last_saved_todos = self.todos.clone();
         self.undo_stack.clear();
         self.file_stamp = if self.scope == Scope::Local {
-            local_view_stamp(&self.local_root, &self.local_path)
+            local_view_stamp(
+                &self.local_root,
+                &self.local_path,
+                self.descendants_expanded,
+            )
         } else {
             file_stamp(self.path())
         };
@@ -721,7 +767,11 @@ impl App {
     }
 
     fn reload_local(&mut self) -> Result<()> {
-        let (todos, markdown) = load_local_view(&self.local_root, &self.local_path)?;
+        let (todos, markdown) = load_local_view(
+            &self.local_root,
+            &self.local_path,
+            self.descendants_expanded,
+        )?;
         if self.scope == Scope::Local {
             self.todos = todos;
             self.markdown = markdown;
@@ -755,7 +805,11 @@ impl App {
             save_document(self.path(), &self.todos, &self.markdown)?;
         }
         self.file_stamp = if self.scope == Scope::Local {
-            local_view_stamp(&self.local_root, &self.local_path)
+            local_view_stamp(
+                &self.local_root,
+                &self.local_path,
+                self.descendants_expanded,
+            )
         } else {
             file_stamp(self.path())
         };
@@ -795,21 +849,33 @@ impl App {
         let mut refreshed = false;
 
         let current_stamp = if self.scope == Scope::Local {
-            local_view_stamp(&self.local_root, &self.local_path)
+            local_view_stamp(
+                &self.local_root,
+                &self.local_path,
+                self.descendants_expanded,
+            )
         } else {
             file_stamp(self.path())
         };
         if current_stamp != self.file_stamp {
             let path = self.path().to_path_buf();
             if self.scope == Scope::Local {
-                (self.todos, self.markdown) = load_local_view(&self.local_root, &self.local_path)?;
+                (self.todos, self.markdown) = load_local_view(
+                    &self.local_root,
+                    &self.local_path,
+                    self.descendants_expanded,
+                )?;
             } else {
                 (self.todos, self.markdown) = load_document(&path)?;
             }
             self.last_saved_todos = self.todos.clone();
             self.undo_stack.clear();
             self.file_stamp = if self.scope == Scope::Local {
-                local_view_stamp(&self.local_root, &self.local_path)
+                local_view_stamp(
+                    &self.local_root,
+                    &self.local_path,
+                    self.descendants_expanded,
+                )
             } else {
                 file_stamp(&path)
             };
@@ -818,22 +884,33 @@ impl App {
         }
 
         let other_stamp = if self.scope == Scope::Global {
-            local_view_stamp(&self.local_root, &self.local_path)
+            local_view_stamp(
+                &self.local_root,
+                &self.local_path,
+                self.descendants_expanded,
+            )
         } else {
             file_stamp(self.other_path())
         };
         if other_stamp != self.other_file_stamp {
             let path = self.other_path().to_path_buf();
             if self.scope == Scope::Global {
-                (self.other_todos, self.other_markdown) =
-                    load_local_view(&self.local_root, &self.local_path)?;
+                (self.other_todos, self.other_markdown) = load_local_view(
+                    &self.local_root,
+                    &self.local_path,
+                    self.descendants_expanded,
+                )?;
             } else {
                 (self.other_todos, self.other_markdown) = load_document(&path)?;
             }
             self.other_last_saved_todos = self.other_todos.clone();
             self.other_undo_stack.clear();
             self.other_file_stamp = if self.scope == Scope::Global {
-                local_view_stamp(&self.local_root, &self.local_path)
+                local_view_stamp(
+                    &self.local_root,
+                    &self.local_path,
+                    self.descendants_expanded,
+                )
             } else {
                 file_stamp(&path)
             };
@@ -876,8 +953,8 @@ impl App {
         if new_path == self.local_path {
             return Ok(());
         }
-        let (todos, markdown) = load_local_view(&cwd, &new_path)?;
-        let new_stamp = local_view_stamp(&cwd, &new_path);
+        let (todos, markdown) = load_local_view(&cwd, &new_path, self.descendants_expanded)?;
+        let new_stamp = local_view_stamp(&cwd, &new_path, self.descendants_expanded);
         self.local_path = new_path;
         self.local_root = cwd.clone();
         if self.scope == Scope::Local {
@@ -933,8 +1010,8 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
     })
 }
 
-fn local_tree_stamp(root: &Path) -> Option<FileStamp> {
-    let paths = local_todo_paths(root).ok()?;
+fn local_tree_stamp(root: &Path, include_descendants: bool) -> Option<FileStamp> {
+    let paths = local_todo_paths(root, include_descendants).ok()?;
     let mut modified = None;
     let mut len = 0_u64;
     for path in paths {
@@ -950,8 +1027,8 @@ fn local_tree_stamp(root: &Path) -> Option<FileStamp> {
     Some(FileStamp { modified, len })
 }
 
-fn local_view_stamp(root: &Path, primary: &Path) -> Option<FileStamp> {
-    let tree = local_tree_stamp(root);
+fn local_view_stamp(root: &Path, primary: &Path, include_descendants: bool) -> Option<FileStamp> {
+    let tree = local_tree_stamp(root, include_descendants);
     if primary.file_name().is_none_or(|name| name == "TODO.md") {
         return tree;
     }
@@ -1038,15 +1115,22 @@ fn ancestor_todo_paths(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn local_todo_paths(root: &Path) -> Result<Vec<PathBuf>> {
+fn local_todo_paths(root: &Path, include_descendants: bool) -> Result<Vec<PathBuf>> {
     let mut paths = read_shared_ancestors(root)?;
-    collect_descendant_todos(root, &mut paths)?;
+    if include_descendants {
+        collect_descendant_todos(root, 0, &mut paths)?;
+    } else {
+        let primary = root.join("TODO.md");
+        if primary.is_file() {
+            paths.push(primary);
+        }
+    }
     paths.sort();
     paths.dedup();
     Ok(paths)
 }
 
-fn collect_descendant_todos(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_descendant_todos(dir: &Path, depth: usize, paths: &mut Vec<PathBuf>) -> Result<()> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Ok(());
     };
@@ -1063,8 +1147,9 @@ fn collect_descendant_todos(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<()> 
             if !matches!(
                 entry.file_name().to_str(),
                 Some(".git" | "target" | "node_modules")
-            ) {
-                collect_descendant_todos(&path, paths)?;
+            ) && depth < MAX_DESCENDANT_DEPTH
+            {
+                collect_descendant_todos(&path, depth + 1, paths)?;
             }
         } else if file_type.is_file() && entry.file_name() == "TODO.md" {
             paths.push(path);
@@ -1073,17 +1158,24 @@ fn collect_descendant_todos(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<()> 
     Ok(())
 }
 
-fn load_local_documents(root: &Path) -> Result<(Vec<Todo>, Vec<MarkdownLine>)> {
+fn load_local_documents(
+    root: &Path,
+    include_descendants: bool,
+) -> Result<(Vec<Todo>, Vec<MarkdownLine>)> {
     let mut all_todos = Vec::new();
     let mut all_markdown = Vec::new();
-    for path in local_todo_paths(root)? {
+    for path in local_todo_paths(root, include_descendants)? {
         append_document(&path, &mut all_todos, &mut all_markdown)?;
     }
     Ok((all_todos, all_markdown))
 }
 
-fn load_local_view(root: &Path, primary: &Path) -> Result<(Vec<Todo>, Vec<MarkdownLine>)> {
-    let (mut todos, mut markdown) = load_local_documents(root)?;
+fn load_local_view(
+    root: &Path,
+    primary: &Path,
+    include_descendants: bool,
+) -> Result<(Vec<Todo>, Vec<MarkdownLine>)> {
+    let (mut todos, mut markdown) = load_local_documents(root, include_descendants)?;
     if primary.file_name().is_some_and(|name| name != "TODO.md") && primary.exists() {
         append_document(primary, &mut todos, &mut markdown)?;
     }
@@ -1695,6 +1787,7 @@ fn render_todo_list(
     area: ratatui::layout::Rect,
     name: &str,
     path: &Path,
+    cwd: Option<&Path>,
     document: DocumentRef<'_>,
     view: TodoListView<'_>,
 ) {
@@ -1812,11 +1905,14 @@ fn render_todo_list(
             format!("  /{query} ({matches})")
         })
         .unwrap_or_default();
+    let cwd = cwd
+        .map(|cwd| format!(" · {}", cwd.display()))
+        .unwrap_or_default();
     let list = List::new(items)
         .block(
             Block::default()
                 .title(format!(
-                    " {marker} {name} · {} TODO · {completed} done{search}{availability} ",
+                    " {marker} {name} · {} TODO{cwd} · {completed} done{search}{availability} ",
                     todos.len()
                 ))
                 .borders(Borders::ALL)
@@ -1919,11 +2015,17 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             app.selected,
         ),
     };
+    let local_name = if app.descendants_expanded {
+        "Local ▾ descendants (3 levels)"
+    } else {
+        "Local ▸ descendants"
+    };
     render_todo_list(
         frame,
         areas[0],
-        "Local",
+        local_name,
         &app.local_path,
+        Some(&app.local_root),
         DocumentRef {
             todos: local_todos,
             markdown: local_markdown,
@@ -1943,6 +2045,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         areas[1],
         "Global",
         &app.global_path,
+        None,
         DocumentRef {
             todos: global_todos,
             markdown: global_markdown,
@@ -2071,6 +2174,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Line::from("/ search text/category  c category  f group category  u undo"),
             Line::from("p priority  s sort  t due  S save  C create"),
             Line::from("h/l or </> outdent/indent  gg/G first/last"),
+            Line::from("v expand/collapse Local descendants (up to 3 levels)"),
             Line::from("Priority: P1 high, P2 medium, P3 low, -- unset"),
             Line::from("Cmd+Shift+Q quit (q/Esc stay open)"),
             Line::from("Enter/Esc closes this help"),
@@ -2162,6 +2266,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::Char('u') => app.undo()?,
         KeyCode::Char('/') => app.start_search(),
         KeyCode::Char('-') => app.start_ancestor_picker()?,
+        KeyCode::Char('v') => app.toggle_descendants()?,
         KeyCode::Char('l') | KeyCode::Char('>') | KeyCode::Right => app.change_depth(true)?,
         KeyCode::Char('h') | KeyCode::Char('<') | KeyCode::Left => app.change_depth(false)?,
         KeyCode::Tab => app.toggle_scope()?,
@@ -2460,7 +2565,7 @@ mod tests {
         fs::write(child.join("TODO.md"), "- [ ] descendant\n").unwrap();
 
         write_shared_ancestors(&current, &[root.join("TODO.md")]).unwrap();
-        let (mut todos, markdown) = load_local_documents(&current).unwrap();
+        let (mut todos, markdown) = load_local_documents(&current, true).unwrap();
         assert!(todos.iter().any(|todo| todo.text == "ancestor"));
         assert!(todos.iter().any(|todo| todo.text == "descendant"));
 
@@ -2479,6 +2584,54 @@ mod tests {
             fs::read_to_string(child.join("TODO.md"))
                 .unwrap()
                 .contains("- [ ] descendant")
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn descendant_todos_are_limited_to_three_levels_and_can_be_collapsed() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("herdr-todo-depth-{unique}"));
+        let root = base.join("root");
+        let level1 = root.join("one");
+        let level2 = level1.join("two");
+        let level3 = level2.join("three");
+        let level4 = level3.join("four");
+        fs::create_dir_all(&level4).unwrap();
+        for (dir, text) in [
+            (&root, "root"),
+            (&level1, "level 1"),
+            (&level2, "level 2"),
+            (&level3, "level 3"),
+            (&level4, "level 4"),
+        ] {
+            fs::write(dir.join("TODO.md"), format!("- [ ] {text}\n")).unwrap();
+        }
+
+        let (expanded, _) = load_local_documents(&root, true).unwrap();
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|todo| todo.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root", "level 1", "level 2", "level 3"]
+        );
+
+        let (collapsed, _) = load_local_documents(&root, false).unwrap();
+        assert_eq!(
+            collapsed
+                .iter()
+                .map(|todo| todo.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
         );
 
         fs::remove_dir_all(base).unwrap();
