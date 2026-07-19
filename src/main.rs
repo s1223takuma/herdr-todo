@@ -152,6 +152,7 @@ struct App {
     ancestor_candidates: Vec<(PathBuf, bool)>,
     ancestor_selected: usize,
     descendants_expanded: bool,
+    cmd_shift_q_quit: bool,
 }
 
 impl App {
@@ -194,6 +195,7 @@ impl App {
             ancestor_candidates: Vec::new(),
             ancestor_selected: 0,
             descendants_expanded,
+            cmd_shift_q_quit: option_env!("HERDR_TODO_QUIT_KEY") == Some("cmd-shift-q"),
         })
     }
 
@@ -2176,7 +2178,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Line::from("h/l or </> outdent/indent  gg/G first/last"),
             Line::from("v expand/collapse Local descendants (up to 3 levels)"),
             Line::from("Priority: P1 high, P2 medium, P3 low, -- unset"),
-            Line::from("Cmd+Shift+Q quit (q/Esc stay open)"),
+            Line::from(if app.cmd_shift_q_quit {
+                "Cmd+Shift+Q quit (q/Esc stay open)"
+            } else {
+                "q/Esc quit"
+            }),
             Line::from("Enter/Esc closes this help"),
         ];
         frame.render_widget(
@@ -2218,11 +2224,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 }
 
 fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<bool> {
-    if matches!(key.code, KeyCode::Char('q' | 'Q'))
-        && key
-            .modifiers
-            .contains(KeyModifiers::SUPER | KeyModifiers::SHIFT)
-    {
+    if should_quit(key, app.cmd_shift_q_quit) {
         return Ok(true);
     }
 
@@ -2278,6 +2280,20 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<bool> {
         _ => {}
     }
     Ok(false)
+}
+
+fn should_quit(key: KeyEvent, cmd_shift_q_quit: bool) -> bool {
+    if cmd_shift_q_quit {
+        matches!(key.code, KeyCode::Char('q' | 'Q'))
+            && key
+                .modifiers
+                .contains(KeyModifiers::SUPER | KeyModifiers::SHIFT)
+    } else {
+        matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    }
 }
 
 fn handle_input_mode(app: &mut App, key: KeyEvent) -> Result<()> {
@@ -2394,6 +2410,44 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_quit_keys_are_q_and_escape() {
+        assert!(should_quit(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            false
+        ));
+        assert!(should_quit(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            false
+        ));
+        assert!(!should_quit(
+            KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT
+            ),
+            false
+        ));
+    }
+
+    #[test]
+    fn local_quit_key_is_cmd_shift_q() {
+        assert!(should_quit(
+            KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT
+            ),
+            true
+        ));
+        assert!(!should_quit(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            true
+        ));
+        assert!(!should_quit(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            true
+        ));
+    }
 
     #[test]
     fn parses_hierarchy_priority_and_due_date() {
