@@ -62,7 +62,9 @@ Herdr内のプラグインアクションから`Open TODO`を実行します。C
 herdr plugin action invoke open --plugin herdr-todo
 ```
 
-TODOペインはHerdrの右側にsplitとして開きます。現在のHerdrではsplitに幅を直接指定できないため、起動後に境界のドラッグまたはresize modeで調整してください。Herdrのセッションが維持されている間は、ペインも閉じるまで残ります。
+起動中の全ワークスペースにあるTODOペインをまとめて開き直す場合は、プラグインアクションから`Restart All TODOs`を実行します。各ワークスペースのTODOだけを再起動し、分割比率も65/35へ揃えます。
+
+TODOペインはHerdrの右側にsplitとして開きます。通常起動でも新規ワークスペースの自動起動と同じ基準ペインを分割するため、既存の入れ子splitの幅に影響されず自動的に同じ初期サイズになります。必要に応じて境界のドラッグまたはresize modeで調整できます。Herdrのセッションが維持されている間は、ペインも閉じるまで残ります。
 
 Local TODOの参照先は、`Open TODO`を実行した元ペインのカレントディレクトリです。対象プロジェクトのペインを選択してから起動してください。
 
@@ -141,6 +143,7 @@ herdr plugin unlink local.herdr-todo-auto-open
 | `u`                  | 直前の変更を元に戻す                      |
 | `/`                  | TODO本文・カテゴリ名を検索                |
 | `-`                  | 共有する祖先TODOの選択ポップアップ        |
+| `v`                  | 子孫ディレクトリのTODOを展開／折りたたみ  |
 | `r`                  | Markdownファイルを再読み込み              |
 | `?`                  | ヘルプを表示                              |
 | `Cmd+Shift+Q`        | 終了（通常の`q` / `Esc`では閉じません）   |
@@ -168,7 +171,7 @@ TODOの追加・編集はポップアップで行います。`Shift+Enter`また
 
 Localの`TODO.md`は起動時に自動作成されません。存在しない場合はLocal画面に案内が表示され、`Shift+C`で新規作成できます。既存ファイルは上書きしません。
 
-Local画面には現在ディレクトリと子孫ディレクトリにあるすべての`TODO.md`が表示されます。各TODOの先頭には保存元のディレクトリ名が付き、編集は元のファイルへ保存されます。`.git`、`target`、`node_modules`内は探索しません。
+Local画面には現在ディレクトリと3階層目までの子孫ディレクトリにある`TODO.md`が表示されます。`v`で子孫分を展開／折りたたみでき、折りたたみ中も現在ディレクトリと共有祖先のTODOは表示されます。各TODOの先頭には保存元のディレクトリ名が付き、編集は元のファイルへ保存されます。`.git`、`target`、`node_modules`内は探索しません。
 
 祖先ディレクトリの`TODO.md`も表示するには、Localを選択して`-`を押します。`j/k`で移動し、Spaceで共有を切り替え、Enterで確定します。選択結果は現在ディレクトリの`.herdr-todo.toml`へ保存されます。
 
@@ -338,7 +341,9 @@ Run `Open TODO` from the Herdr plugin actions, or invoke it from the command lin
 herdr plugin action invoke open --plugin herdr-todo
 ```
 
-The TODO pane opens as a split on the right. The current Herdr split API does not accept a fixed width, so resize it after opening by dragging the border or using Herdr's resize mode. The pane remains open while the Herdr session is active, unless you close it.
+Run `Restart All TODOs` from the plugin actions to reopen every TODO pane across all running workspaces. It leaves regular panes untouched and normalizes each split to 65/35.
+
+The TODO pane opens as a split on the right. Normal launches now split the same workspace base pane used by automatic launches in new workspaces, so nested split widths do not affect its initial size. You can still adjust it by dragging the border or using Herdr's resize mode. The pane remains open while the Herdr session is active, unless you close it.
 
 The Local TODO path is based on the current directory of the pane from which `Open TODO` is invoked. Select the target project's pane before opening Herdr TODO.
 
@@ -417,6 +422,7 @@ herdr plugin unlink local.herdr-todo-auto-open
 | `u` | Undo the last change |
 | `/` | Search TODO text and category names |
 | `-` | Choose shared ancestor TODO files |
+| `v` | Expand/collapse descendant-directory TODOs |
 | `r` | Reload the Markdown file |
 | `?` | Show help |
 | `Cmd+Shift+Q` | Quit (`q` and `Esc` do not close the pane) |
@@ -444,7 +450,7 @@ Deleting a parent also deletes all of its children.
 
 The Local `TODO.md` is not created automatically. When it is missing, the Local section displays a notice. Press `Shift+C` to create it. An existing file is never overwritten by this command.
 
-The Local pane combines every `TODO.md` in the current directory and its descendants. Each TODO is prefixed with its source directory, and edits are written back to that source file. Directories named `.git`, `target`, and `node_modules` are skipped.
+The Local pane combines `TODO.md` files in the current directory and descendants up to three levels deep. Press `v` to expand or collapse descendant TODOs; the current directory and shared ancestors remain visible while collapsed. Each TODO is prefixed with its source directory, and edits are written back to that source file. Directories named `.git`, `target`, and `node_modules` are skipped.
 
 To include ancestor `TODO.md` files, select Local and press `-`. Move with `j/k`, toggle sharing with Space, and save with Enter. The selection is persisted in `.herdr-todo.toml` in the current directory.
 

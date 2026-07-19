@@ -24,5 +24,14 @@ command = [
   "exec \"$HERDR_PLUGIN_ROOT/scripts/open-todo.sh\""
 ]
 
+[[actions]]
+id = "restart-all"
+title = "Restart All TODOs"
+command = [
+  "sh",
+  "-c",
+  "exec \"$HERDR_PLUGIN_ROOT/scripts/restart-all-todos.sh\""
+]
+
 [[build]]
 command = ["cargo", "build", "--release"]
