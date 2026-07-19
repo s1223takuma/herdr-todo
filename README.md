@@ -146,7 +146,7 @@ herdr plugin unlink local.herdr-todo-auto-open
 | `v`                  | 子孫ディレクトリのTODOを展開／折りたたみ  |
 | `r`                  | Markdownファイルを再読み込み              |
 | `?`                  | ヘルプを表示                              |
-| `Cmd+Shift+Q`        | 終了（通常の`q` / `Esc`では閉じません）   |
+| `q` / `Esc`          | 終了                                    |
 
 TODOの追加・編集はポップアップで行います。`Shift+Enter`または`Alt+Enter`で改行し、`Enter`で保存します。
 
@@ -425,7 +425,7 @@ herdr plugin unlink local.herdr-todo-auto-open
 | `v` | Expand/collapse descendant-directory TODOs |
 | `r` | Reload the Markdown file |
 | `?` | Show help |
-| `Cmd+Shift+Q` | Quit (`q` and `Esc` do not close the pane) |
+| `q` / `Esc` | Quit |
 
 Adding and editing TODOs uses a popup. Press `Shift+Enter` or `Alt+Enter` to insert a newline, `Enter` to save, and `Esc` to cancel.
 
