@@ -3,7 +3,7 @@ use std::{
     io::{self, stdout},
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -63,6 +63,7 @@ struct Todo {
     due: Option<NaiveDate>,
     saved: bool,
     category: Option<String>,
+    source: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +71,7 @@ struct MarkdownLine {
     /// Number of TODOs that appeared before this line in the source file.
     before_todo: usize,
     text: String,
+    source: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +85,12 @@ struct TodoListView<'a> {
     selected: usize,
     active: bool,
     search_query: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +117,7 @@ enum InputMode {
     ConfirmDelete,
     ConfirmBulkDelete,
     Help,
+    AncestorPicker,
 }
 
 struct App {
@@ -135,13 +144,22 @@ struct App {
     other_last_saved_todos: Vec<Todo>,
     search_query: Option<String>,
     other_search_query: Option<String>,
+    file_stamp: Option<FileStamp>,
+    other_file_stamp: Option<FileStamp>,
+    last_file_check: Instant,
+    local_root: PathBuf,
+    ancestor_candidates: Vec<(PathBuf, bool)>,
+    ancestor_selected: usize,
 }
 
 impl App {
     fn new(local_path: PathBuf, global_path: PathBuf) -> Result<Self> {
         ensure_todo_file(&global_path)?;
-        let (todos, markdown) = load_document(&local_path)?;
+        let local_root = local_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let (todos, markdown) = load_local_view(&local_root, &local_path)?;
         let (other_todos, other_markdown) = load_document(&global_path)?;
+        let local_stamp = local_view_stamp(&local_root, &local_path);
+        let global_stamp = file_stamp(&global_path);
         Ok(Self {
             last_saved_todos: todos.clone(),
             other_last_saved_todos: other_todos.clone(),
@@ -166,6 +184,12 @@ impl App {
             other_undo_stack: Vec::new(),
             search_query: None,
             other_search_query: None,
+            file_stamp: local_stamp,
+            other_file_stamp: global_stamp,
+            last_file_check: Instant::now(),
+            local_root,
+            ancestor_candidates: Vec::new(),
+            ancestor_selected: 0,
         })
     }
 
@@ -173,6 +197,13 @@ impl App {
         match self.scope {
             Scope::Local => &self.local_path,
             Scope::Global => &self.global_path,
+        }
+    }
+
+    fn other_path(&self) -> &Path {
+        match self.scope {
+            Scope::Local => &self.global_path,
+            Scope::Global => &self.local_path,
         }
     }
 
@@ -217,10 +248,19 @@ impl App {
     }
 
     fn reorder_selected(&mut self, down: bool) -> Result<()> {
-        let Some(new_selected) = reorder_todo_block(&mut self.todos, self.selected, down) else {
+        let mut reordered = self.todos.clone();
+        let Some(new_selected) = reorder_todo_block(&mut reordered, self.selected, down) else {
             self.set_message("No sibling TODO in that direction", MessageKind::Warning);
             return Ok(());
         };
+        if !sources_are_contiguous(&reordered) {
+            self.set_message(
+                "TODOs cannot be reordered across files",
+                MessageKind::Warning,
+            );
+            return Ok(());
+        }
+        self.todos = reordered;
         self.selected = new_selected;
         self.save()?;
         self.set_message("TODO order updated", MessageKind::Success);
@@ -234,6 +274,7 @@ impl App {
         std::mem::swap(&mut self.undo_stack, &mut self.other_undo_stack);
         std::mem::swap(&mut self.last_saved_todos, &mut self.other_last_saved_todos);
         std::mem::swap(&mut self.search_query, &mut self.other_search_query);
+        std::mem::swap(&mut self.file_stamp, &mut self.other_file_stamp);
         self.scope = match self.scope {
             Scope::Local => Scope::Global,
             Scope::Global => Scope::Local,
@@ -267,6 +308,41 @@ impl App {
         self.input.clear();
         self.input_mode = InputMode::Add;
         self.set_persistent_message("New TODO: Enter to save, Esc to cancel");
+    }
+
+    fn start_ancestor_picker(&mut self) -> Result<()> {
+        if self.scope != Scope::Local {
+            self.set_message(
+                "Switch to Local before configuring ancestors",
+                MessageKind::Warning,
+            );
+            return Ok(());
+        }
+        let enabled = read_shared_ancestors(&self.local_root)?;
+        self.ancestor_candidates = ancestor_todo_paths(&self.local_root)
+            .into_iter()
+            .map(|path| {
+                let selected = enabled.contains(&path);
+                (path, selected)
+            })
+            .collect();
+        self.ancestor_selected = 0;
+        self.input_mode = InputMode::AncestorPicker;
+        self.set_persistent_message("Space: toggle  Enter: save  Esc: cancel");
+        Ok(())
+    }
+
+    fn save_ancestor_picker(&mut self) -> Result<()> {
+        let selected = self
+            .ancestor_candidates
+            .iter()
+            .filter_map(|(path, selected)| selected.then_some(path.clone()))
+            .collect::<Vec<_>>();
+        write_shared_ancestors(&self.local_root, &selected)?;
+        self.input_mode = InputMode::Normal;
+        self.reload_local()?;
+        self.set_message("Shared ancestor TODOs updated", MessageKind::Success);
+        Ok(())
     }
 
     fn start_edit(&mut self) {
@@ -324,11 +400,19 @@ impl App {
             return Ok(());
         }
         ensure_todo_file(&self.local_path)?;
+        let (todos, markdown) = load_local_view(&self.local_root, &self.local_path)?;
+        let stamp = local_view_stamp(&self.local_root, &self.local_path);
         if self.scope == Scope::Local {
-            (self.todos, self.markdown) = load_document(&self.local_path)?;
+            self.todos = todos;
+            self.markdown = markdown;
+            self.last_saved_todos = self.todos.clone();
+            self.file_stamp = stamp;
             self.selected = 0;
         } else {
-            (self.other_todos, self.other_markdown) = load_document(&self.local_path)?;
+            self.other_todos = todos;
+            self.other_markdown = markdown;
+            self.other_last_saved_todos = self.other_todos.clone();
+            self.other_file_stamp = stamp;
             self.other_selected = 0;
         }
         self.set_message("Created Local TODO.md", MessageKind::Success);
@@ -356,17 +440,42 @@ impl App {
                     self.set_message("TODO text cannot be empty", MessageKind::Warning);
                     return Ok(());
                 }
-                let depth = self.todos.get(self.selected).map_or(0, |todo| todo.depth);
-                self.todos.push(Todo {
-                    checked: false,
-                    text,
-                    depth,
-                    priority: Priority::None,
-                    due: None,
-                    saved: false,
-                    category: None,
-                });
-                self.selected = self.todos.len() - 1;
+                let source = (self.scope == Scope::Local).then(|| self.local_path.clone());
+                let insert_at = if let Some(source) = source.as_ref() {
+                    self.todos
+                        .iter()
+                        .rposition(|todo| todo.source.as_ref() == Some(source))
+                        .map(|index| index + 1)
+                        .unwrap_or_else(|| {
+                            self.todos
+                                .iter()
+                                .position(|todo| {
+                                    todo.source.as_ref().is_some_and(|path| path > source)
+                                })
+                                .unwrap_or(self.todos.len())
+                        })
+                } else {
+                    self.todos.len()
+                };
+                let depth = insert_at
+                    .checked_sub(1)
+                    .and_then(|index| self.todos.get(index))
+                    .filter(|todo| todo.source == source)
+                    .map_or(0, |todo| todo.depth);
+                self.todos.insert(
+                    insert_at,
+                    Todo {
+                        checked: false,
+                        text,
+                        depth,
+                        priority: Priority::None,
+                        due: None,
+                        saved: false,
+                        category: None,
+                        source,
+                    },
+                );
+                self.selected = insert_at;
             }
             InputMode::Edit => {
                 if text.is_empty() {
@@ -444,7 +553,11 @@ impl App {
         }
         let depth = self.todos[self.selected].depth;
         let mut end = self.selected + 1;
-        while end < self.todos.len() && self.todos[end].depth > depth {
+        let source = self.todos[self.selected].source.clone();
+        while end < self.todos.len()
+            && self.todos[end].source == source
+            && self.todos[end].depth > depth
+        {
             end += 1;
         }
         self.todos.drain(self.selected..end);
@@ -459,13 +572,18 @@ impl App {
         let before = self.todos.len();
         let mut retained = Vec::with_capacity(before);
         let mut skipped_depth = None;
+        let mut skipped_source = None;
         for todo in self.todos.drain(..) {
+            if skipped_source != todo.source {
+                skipped_depth = None;
+            }
             if skipped_depth.is_some_and(|depth| todo.depth > depth) {
                 continue;
             }
             skipped_depth = None;
             if todo.checked {
                 skipped_depth = Some(todo.depth);
+                skipped_source = todo.source.clone();
             } else {
                 retained.push(todo);
             }
@@ -487,7 +605,9 @@ impl App {
             return Ok(());
         }
         let new_depth = if indent {
-            if self.selected == 0 {
+            if self.selected == 0
+                || self.todos[self.selected - 1].source != self.todos[self.selected].source
+            {
                 return Ok(());
             }
             let max_depth = self.todos[self.selected - 1].depth + 1;
@@ -498,7 +618,11 @@ impl App {
         let old_depth = self.todos[self.selected].depth;
         let difference = new_depth as isize - old_depth as isize;
         let mut end = self.selected + 1;
-        while end < self.todos.len() && self.todos[end].depth > old_depth {
+        let source = self.todos[self.selected].source.clone();
+        while end < self.todos.len()
+            && self.todos[end].source == source
+            && self.todos[end].depth > old_depth
+        {
             end += 1;
         }
         for todo in &mut self.todos[self.selected..end] {
@@ -538,7 +662,7 @@ impl App {
     }
 
     fn sort_by_priority(&mut self) -> Result<()> {
-        sort_siblings(&mut self.todos);
+        for_each_source(&mut self.todos, sort_siblings);
         self.selected = self.selected.min(self.todos.len().saturating_sub(1));
         self.save()?;
         self.set_message("Sorted by priority and due date", MessageKind::Success);
@@ -546,7 +670,7 @@ impl App {
     }
 
     fn group_by_category(&mut self) -> Result<()> {
-        group_categories(&mut self.todos);
+        for_each_source(&mut self.todos, group_categories);
         self.selected = self.selected.min(self.todos.len().saturating_sub(1));
         self.save()?;
         self.set_message("Grouped by category priority", MessageKind::Success);
@@ -561,7 +685,13 @@ impl App {
         self.todos = previous;
         self.last_saved_todos = self.todos.clone();
         self.normalize_selection();
-        save_document(self.path(), &self.todos, &self.markdown)?;
+        if self.scope == Scope::Local {
+            save_local_documents(&self.todos, &self.markdown)?;
+            self.file_stamp = local_view_stamp(&self.local_root, &self.local_path);
+        } else {
+            save_document(self.path(), &self.todos, &self.markdown)?;
+            self.file_stamp = file_stamp(self.path());
+        }
         self.set_message("Undid last change", MessageKind::Success);
         Ok(())
     }
@@ -573,12 +703,40 @@ impl App {
     }
 
     fn reload(&mut self) -> Result<()> {
+        if self.scope == Scope::Local {
+            return self.reload_local();
+        }
         let (todos, markdown) = load_document(self.path())?;
         self.todos = todos;
         self.markdown = markdown;
         self.last_saved_todos = self.todos.clone();
         self.undo_stack.clear();
+        self.file_stamp = if self.scope == Scope::Local {
+            local_view_stamp(&self.local_root, &self.local_path)
+        } else {
+            file_stamp(self.path())
+        };
         self.normalize_selection();
+        Ok(())
+    }
+
+    fn reload_local(&mut self) -> Result<()> {
+        let (todos, markdown) = load_local_view(&self.local_root, &self.local_path)?;
+        if self.scope == Scope::Local {
+            self.todos = todos;
+            self.markdown = markdown;
+            self.last_saved_todos = self.todos.clone();
+            self.undo_stack.clear();
+            self.normalize_selection();
+        } else {
+            self.other_todos = todos;
+            self.other_markdown = markdown;
+            self.other_last_saved_todos = self.other_todos.clone();
+            self.other_undo_stack.clear();
+            self.other_selected = self
+                .other_selected
+                .min(self.other_todos.len().saturating_sub(1));
+        }
         Ok(())
     }
 
@@ -591,7 +749,17 @@ impl App {
             }
             self.last_saved_todos = self.todos.clone();
         }
-        save_document(self.path(), &self.todos, &self.markdown)
+        if self.scope == Scope::Local {
+            save_local_documents(&self.todos, &self.markdown)?;
+        } else {
+            save_document(self.path(), &self.todos, &self.markdown)?;
+        }
+        self.file_stamp = if self.scope == Scope::Local {
+            local_view_stamp(&self.local_root, &self.local_path)
+        } else {
+            file_stamp(self.path())
+        };
+        Ok(())
     }
 
     fn set_message(&mut self, message: impl Into<String>, kind: MessageKind) {
@@ -615,6 +783,70 @@ impl App {
             self.message_kind = MessageKind::Default;
             self.message_until = None;
         }
+    }
+
+    fn refresh_changed_files(&mut self) -> Result<()> {
+        if self.input_mode != InputMode::Normal
+            || self.last_file_check.elapsed() < Duration::from_millis(500)
+        {
+            return Ok(());
+        }
+        self.last_file_check = Instant::now();
+        let mut refreshed = false;
+
+        let current_stamp = if self.scope == Scope::Local {
+            local_view_stamp(&self.local_root, &self.local_path)
+        } else {
+            file_stamp(self.path())
+        };
+        if current_stamp != self.file_stamp {
+            let path = self.path().to_path_buf();
+            if self.scope == Scope::Local {
+                (self.todos, self.markdown) = load_local_view(&self.local_root, &self.local_path)?;
+            } else {
+                (self.todos, self.markdown) = load_document(&path)?;
+            }
+            self.last_saved_todos = self.todos.clone();
+            self.undo_stack.clear();
+            self.file_stamp = if self.scope == Scope::Local {
+                local_view_stamp(&self.local_root, &self.local_path)
+            } else {
+                file_stamp(&path)
+            };
+            self.normalize_selection();
+            refreshed = true;
+        }
+
+        let other_stamp = if self.scope == Scope::Global {
+            local_view_stamp(&self.local_root, &self.local_path)
+        } else {
+            file_stamp(self.other_path())
+        };
+        if other_stamp != self.other_file_stamp {
+            let path = self.other_path().to_path_buf();
+            if self.scope == Scope::Global {
+                (self.other_todos, self.other_markdown) =
+                    load_local_view(&self.local_root, &self.local_path)?;
+            } else {
+                (self.other_todos, self.other_markdown) = load_document(&path)?;
+            }
+            self.other_last_saved_todos = self.other_todos.clone();
+            self.other_undo_stack.clear();
+            self.other_file_stamp = if self.scope == Scope::Global {
+                local_view_stamp(&self.local_root, &self.local_path)
+            } else {
+                file_stamp(&path)
+            };
+            self.other_selected = self
+                .other_selected
+                .min(self.other_todos.len().saturating_sub(1));
+            refreshed = true;
+        }
+
+        if refreshed {
+            self.set_message("TODO files updated automatically", MessageKind::Success);
+        }
+        Ok(())
     }
 
     fn update_local_cwd(&mut self) -> Result<()> {
@@ -644,19 +876,23 @@ impl App {
         if new_path == self.local_path {
             return Ok(());
         }
-        let (todos, markdown) = load_document(&new_path)?;
+        let (todos, markdown) = load_local_view(&cwd, &new_path)?;
+        let new_stamp = local_view_stamp(&cwd, &new_path);
         self.local_path = new_path;
+        self.local_root = cwd.clone();
         if self.scope == Scope::Local {
             self.todos = todos;
             self.markdown = markdown;
             self.last_saved_todos = self.todos.clone();
             self.undo_stack.clear();
+            self.file_stamp = new_stamp;
             self.selected = self.selected.min(self.todos.len().saturating_sub(1));
         } else {
             self.other_todos = todos;
             self.other_markdown = markdown;
             self.other_last_saved_todos = self.other_todos.clone();
             self.other_undo_stack.clear();
+            self.other_file_stamp = new_stamp;
             self.other_selected = self
                 .other_selected
                 .min(self.other_todos.len().saturating_sub(1));
@@ -689,6 +925,48 @@ fn ensure_todo_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(FileStamp {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    })
+}
+
+fn local_tree_stamp(root: &Path) -> Option<FileStamp> {
+    let paths = local_todo_paths(root).ok()?;
+    let mut modified = None;
+    let mut len = 0_u64;
+    for path in paths {
+        let Some(stamp) = file_stamp(&path) else {
+            continue;
+        };
+        modified = match (modified, stamp.modified) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (None, value) | (value, None) => value,
+        };
+        len = len.saturating_add(stamp.len);
+    }
+    Some(FileStamp { modified, len })
+}
+
+fn local_view_stamp(root: &Path, primary: &Path) -> Option<FileStamp> {
+    let tree = local_tree_stamp(root);
+    if primary.file_name().is_none_or(|name| name == "TODO.md") {
+        return tree;
+    }
+    match (tree, file_stamp(primary)) {
+        (Some(left), Some(right)) => Some(FileStamp {
+            modified: match (left.modified, right.modified) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (None, value) | (value, None) => value,
+            },
+            len: left.len.saturating_add(right.len),
+        }),
+        (value, None) | (None, value) => value,
+    }
+}
+
 fn load_document(path: &Path) -> Result<(Vec<Todo>, Vec<MarkdownLine>)> {
     if !path.exists() {
         return Ok((Vec::new(), Vec::new()));
@@ -710,6 +988,7 @@ fn load_document(path: &Path) -> Result<(Vec<Todo>, Vec<MarkdownLine>)> {
             markdown.push(MarkdownLine {
                 before_todo: todos.len(),
                 text: line.to_string(),
+                source: None,
             });
         }
     }
@@ -717,6 +996,139 @@ fn load_document(path: &Path) -> Result<(Vec<Todo>, Vec<MarkdownLine>)> {
         save_document(path, &todos, &markdown)?;
     }
     Ok((todos, markdown))
+}
+
+fn config_path(root: &Path) -> PathBuf {
+    root.join(".herdr-todo.toml")
+}
+
+fn read_shared_ancestors(root: &Path) -> Result<Vec<PathBuf>> {
+    let path = config_path(root);
+    let Ok(content) = fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    Ok(content
+        .lines()
+        .filter_map(|line| {
+            let value = line.trim().strip_suffix(',')?.trim();
+            let value = value.strip_prefix('"')?.strip_suffix('"')?;
+            Some(root.join(value))
+        })
+        .collect())
+}
+
+fn write_shared_ancestors(root: &Path, paths: &[PathBuf]) -> Result<()> {
+    let mut output = String::from("# Managed by Herdr TODO\nshared_ancestors = [\n");
+    for path in paths {
+        let relative = path
+            .strip_prefix(root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.clone());
+        output.push_str(&format!("  \"{}\",\n", relative.display()));
+    }
+    output.push_str("]\n");
+    fs::write(config_path(root), output).context("failed to save .herdr-todo.toml")
+}
+
+fn ancestor_todo_paths(root: &Path) -> Vec<PathBuf> {
+    root.ancestors()
+        .skip(1)
+        .map(|dir| dir.join("TODO.md"))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+fn local_todo_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = read_shared_ancestors(root)?;
+    collect_descendant_todos(root, &mut paths)?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn collect_descendant_todos(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "target" | "node_modules")
+            ) {
+                collect_descendant_todos(&path, paths)?;
+            }
+        } else if file_type.is_file() && entry.file_name() == "TODO.md" {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn load_local_documents(root: &Path) -> Result<(Vec<Todo>, Vec<MarkdownLine>)> {
+    let mut all_todos = Vec::new();
+    let mut all_markdown = Vec::new();
+    for path in local_todo_paths(root)? {
+        append_document(&path, &mut all_todos, &mut all_markdown)?;
+    }
+    Ok((all_todos, all_markdown))
+}
+
+fn load_local_view(root: &Path, primary: &Path) -> Result<(Vec<Todo>, Vec<MarkdownLine>)> {
+    let (mut todos, mut markdown) = load_local_documents(root)?;
+    if primary.file_name().is_some_and(|name| name != "TODO.md") && primary.exists() {
+        append_document(primary, &mut todos, &mut markdown)?;
+    }
+    Ok((todos, markdown))
+}
+
+fn append_document(
+    path: &Path,
+    all_todos: &mut Vec<Todo>,
+    all_markdown: &mut Vec<MarkdownLine>,
+) -> Result<()> {
+    let (mut todos, mut markdown) = load_document(path)?;
+    for todo in &mut todos {
+        todo.source = Some(path.to_path_buf());
+    }
+    for line in &mut markdown {
+        line.source = Some(path.to_path_buf());
+    }
+    all_todos.extend(todos);
+    all_markdown.extend(markdown);
+    Ok(())
+}
+
+fn save_local_documents(todos: &[Todo], markdown: &[MarkdownLine]) -> Result<()> {
+    let mut paths = todos
+        .iter()
+        .filter_map(|todo| todo.source.clone())
+        .chain(markdown.iter().filter_map(|line| line.source.clone()))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        let file_todos = todos
+            .iter()
+            .filter(|todo| todo.source.as_deref() == Some(path.as_path()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let file_markdown = markdown
+            .iter()
+            .filter(|line| line.source.as_deref() == Some(path.as_path()))
+            .cloned()
+            .collect::<Vec<_>>();
+        save_document(&path, &file_todos, &file_markdown)?;
+    }
+    Ok(())
 }
 
 fn parse_todo_line(line: &str) -> Option<Todo> {
@@ -754,13 +1166,14 @@ fn parse_todo_line(line: &str) -> Option<Todo> {
     } else {
         (None, rest)
     };
-    let (text, due) = match rest.rsplit_once(" 📅 ") {
-        Some((text, date)) => match NaiveDate::parse_from_str(date, "%Y-%m-%d") {
-            Ok(date) => (text.to_string(), Some(date)),
-            Err(_) => (rest.to_string(), None),
-        },
-        None => (rest.to_string(), None),
-    };
+    let (text, due) = rest
+        .rsplit_once(" ")
+        .and_then(|(text, date)| {
+            NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .ok()
+                .map(|date| (text.trim_end_matches(" 📅").to_string(), Some(date)))
+        })
+        .unwrap_or_else(|| (rest.to_string(), None));
     Some(Todo {
         checked,
         text,
@@ -769,6 +1182,7 @@ fn parse_todo_line(line: &str) -> Option<Todo> {
         due,
         saved,
         category,
+        source: None,
     })
 }
 
@@ -791,10 +1205,7 @@ fn save_document(path: &Path, todos: &[Todo], markdown: &[MarkdownLine]) -> Resu
         } else {
             format!("[{}] ", todo.priority.label())
         };
-        let due = todo
-            .due
-            .map(|date| format!(" 📅 {date}"))
-            .unwrap_or_default();
+        let due = todo.due.map(|date| format!(" {date}")).unwrap_or_default();
         let saved = if todo.saved { "[SAVE] " } else { "" };
         let category = todo
             .category
@@ -855,6 +1266,35 @@ fn reorder_todo_block(todos: &mut [Todo], selected: usize, down: bool) -> Option
         }
         todos[previous_start..selected_end].rotate_right(selected_end - selected);
         Some(previous_start)
+    }
+}
+
+fn sources_are_contiguous(todos: &[Todo]) -> bool {
+    let mut seen = Vec::new();
+    let mut previous: Option<&Option<PathBuf>> = None;
+    for todo in todos {
+        if previous == Some(&todo.source) {
+            continue;
+        }
+        if seen.contains(&todo.source) {
+            return false;
+        }
+        seen.push(todo.source.clone());
+        previous = Some(&todo.source);
+    }
+    true
+}
+
+fn for_each_source(todos: &mut Vec<Todo>, operation: fn(&mut Vec<Todo>)) {
+    let mut remaining = std::mem::take(todos).into_iter().peekable();
+    while let Some(first) = remaining.next() {
+        let source = first.source.clone();
+        let mut group = vec![first];
+        while remaining.peek().is_some_and(|todo| todo.source == source) {
+            group.push(remaining.next().expect("peeked TODO must exist"));
+        }
+        operation(&mut group);
+        todos.extend(group);
     }
 }
 
@@ -984,19 +1424,31 @@ fn sort_siblings(todos: &mut Vec<Todo>) {
 }
 
 fn wrap_display_width(text: &str, max_width: usize) -> Vec<Line<'static>> {
+    wrap_strings(text, max_width)
+        .into_iter()
+        .map(Line::from)
+        .collect()
+}
+
+fn wrap_strings(text: &str, max_width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     let mut width = 0;
     for character in text.chars() {
+        if character == '\n' {
+            lines.push(std::mem::take(&mut current));
+            width = 0;
+            continue;
+        }
         let character_width = character.width().unwrap_or(0);
         if width > 0 && width + character_width > max_width {
-            lines.push(Line::from(std::mem::take(&mut current)));
+            lines.push(std::mem::take(&mut current));
             width = 0;
         }
         current.push(character);
         width += character_width;
     }
-    lines.push(Line::from(current));
+    lines.push(current);
     lines
 }
 
@@ -1076,7 +1528,7 @@ fn render_table(lines: &[&MarkdownLine], available_width: usize) -> Vec<(String,
                 .join(&middle.to_string())
         )
     };
-    let border_style = Style::default().fg(Color::DarkGray);
+    let border_style = Style::default().fg(Color::Gray);
     let mut rendered = vec![(border('┌', '┬', '┐'), border_style)];
     for (row_index, row) in rows.iter().enumerate() {
         let content = (0..columns)
@@ -1085,10 +1537,10 @@ fn render_table(lines: &[&MarkdownLine], available_width: usize) -> Vec<(String,
             .join(" │ ");
         let style = if row_index == 0 {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(Color::White)
         };
         rendered.push((format!("│ {content} │"), style));
         if row_index == 0 && rows.len() > 1 {
@@ -1102,21 +1554,128 @@ fn render_table(lines: &[&MarkdownLine], available_width: usize) -> Vec<(String,
 fn todo_style(todo: &Todo, today: NaiveDate) -> Style {
     if todo.checked {
         return Style::default()
-            .fg(Color::DarkGray)
+            .fg(Color::Gray)
+            .add_modifier(Modifier::CROSSED_OUT);
+    }
+    let _ = today;
+    match todo.priority {
+        Priority::High => Style::default().fg(Color::Rgb(255, 105, 180)),
+        Priority::Medium => Style::default().fg(Color::LightBlue),
+        Priority::Low => Style::default().fg(Color::Rgb(173, 255, 47)),
+        Priority::None => Style::default().fg(Color::White),
+    }
+}
+
+fn priority_style(todo: &Todo) -> Style {
+    if todo.checked {
+        return Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::CROSSED_OUT);
+    }
+    match todo.priority {
+        Priority::High => Style::default()
+            .fg(Color::Rgb(255, 105, 180))
+            .add_modifier(Modifier::BOLD),
+        Priority::Medium => Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD),
+        Priority::Low => Style::default()
+            .fg(Color::Rgb(173, 255, 47))
+            .add_modifier(Modifier::BOLD),
+        Priority::None => Style::default().fg(Color::White),
+    }
+}
+
+fn due_style(todo: &Todo, today: NaiveDate) -> Style {
+    if todo.checked {
+        return Style::default()
+            .fg(Color::Gray)
             .add_modifier(Modifier::CROSSED_OUT);
     }
     if todo.due.is_some_and(|due| due < today) {
-        return Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+        return Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD);
     }
     let tomorrow = today
         .checked_add_days(chrono::Days::new(1))
         .unwrap_or(NaiveDate::MAX);
     if todo.due.is_some_and(|due| due <= tomorrow) {
         return Style::default()
-            .fg(Color::Yellow)
+            .fg(Color::LightYellow)
             .add_modifier(Modifier::BOLD);
     }
-    Style::default()
+    Style::default().fg(Color::Gray)
+}
+
+fn todo_list_item(todo: &Todo, available_width: usize, today: NaiveDate) -> ListItem<'static> {
+    let hierarchy = if todo.depth == 0 {
+        String::new()
+    } else {
+        format!("{}|-- ", "|  ".repeat(todo.depth.saturating_sub(1)))
+    };
+    let mark = if todo.checked { "☑ " } else { "☐ " };
+    let priority = format!("{:>2}", todo.priority.label());
+    let saved = if todo.saved { "  SAVE" } else { "" };
+    let category = todo
+        .category
+        .as_ref()
+        .map(|category| format!("  #{category}"))
+        .unwrap_or_default();
+    let due = todo
+        .due
+        .map(|date| format!("  due:{date}"))
+        .unwrap_or_default();
+    let location = todo
+        .source
+        .as_ref()
+        .and_then(|path| path.parent())
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(|name| format!("[{name}] "))
+        .unwrap_or_default();
+    let prefix_width = location.width()
+        + hierarchy.width()
+        + mark.width()
+        + priority.width()
+        + saved.width()
+        + category.width()
+        + 2;
+    let text_width = available_width
+        .saturating_sub(prefix_width + due.width())
+        .max(1);
+    let wrapped = wrap_strings(&todo.text, text_width);
+    let body_style = todo_style(todo, today);
+    let saved_style = if todo.checked {
+        body_style
+    } else {
+        Style::default().fg(Color::LightMagenta)
+    };
+    let category_style = if todo.checked {
+        body_style
+    } else {
+        Style::default().fg(Color::LightCyan)
+    };
+    let mut lines = Vec::with_capacity(wrapped.len());
+    let first = wrapped.first().cloned().unwrap_or_default();
+    lines.push(Line::from(vec![
+        Span::styled(location, Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{hierarchy}{mark}"), body_style),
+        Span::styled(priority, priority_style(todo)),
+        Span::styled(saved, saved_style),
+        Span::styled(category, category_style),
+        Span::styled("  ", body_style),
+        Span::styled(first, body_style),
+        Span::styled(due, due_style(todo, today)),
+    ]));
+    let continuation = " ".repeat(prefix_width);
+    for line in wrapped.into_iter().skip(1) {
+        lines.push(Line::from(vec![
+            Span::raw(continuation.clone()),
+            Span::styled(line, body_style),
+        ]));
+    }
+    ListItem::new(lines)
 }
 
 fn todo_matches_search(todo: &Todo, query: Option<&str>) -> bool {
@@ -1154,7 +1713,18 @@ fn render_todo_list(
         let markdown_lines: Vec<_> = if search_query.is_none() {
             markdown
                 .iter()
-                .filter(|line| line.before_todo.min(todos.len()) == index)
+                .filter(|line| {
+                    let offset = line
+                        .source
+                        .as_ref()
+                        .and_then(|source| {
+                            todos
+                                .iter()
+                                .position(|todo| todo.source.as_ref() == Some(source))
+                        })
+                        .unwrap_or(0);
+                    (offset + line.before_todo).min(todos.len()) == index
+                })
                 .collect()
         } else {
             Vec::new()
@@ -1193,17 +1763,20 @@ fn render_todo_list(
                 };
                 (
                     format!("{} {heading}", "━".repeat(heading_level.saturating_sub(1))),
-                    Style::default().fg(Color::Cyan).add_modifier(modifier),
+                    Style::default().fg(Color::LightCyan).add_modifier(modifier),
                 )
             } else if let Some(quote) = trimmed.strip_prefix("> ") {
                 (
                     format!("│ {quote}"),
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(Color::Gray)
                         .add_modifier(Modifier::ITALIC),
                 )
             } else {
-                (markdown_line.text.clone(), Style::default().fg(Color::Gray))
+                (
+                    markdown_line.text.clone(),
+                    Style::default().fg(Color::White),
+                )
             };
             items.push(ListItem::new(wrap_display_width(&display, available_width)).style(style));
             markdown_index += 1;
@@ -1215,60 +1788,47 @@ fn render_todo_list(
             .get(index)
             .filter(|todo| todo_matches_search(todo, search_query))
         {
-            let mark = if todo.checked { "☑" } else { "☐" };
-            let hierarchy = if todo.depth == 0 {
-                String::new()
-            } else {
-                format!("{}├── ", "│  ".repeat(todo.depth.saturating_sub(1)))
-            };
-            let prefix = format!(
-                "{}{} [{}]{}{} ",
-                hierarchy,
-                mark,
-                todo.priority.label(),
-                if todo.saved { " [SAVE]" } else { "" },
-                todo.category
-                    .as_ref()
-                    .map(|category| format!(" [{category}]"))
-                    .unwrap_or_default()
-            );
-            let due = todo
-                .due
-                .map(|date| format!("  📅 {date}"))
-                .unwrap_or_default();
-            let content = format!("{prefix}{}{due}", todo.text);
-            let style = todo_style(todo, today);
-            items.push(ListItem::new(wrap_display_width(&content, available_width)).style(style));
+            items.push(todo_list_item(todo, available_width, today));
         }
     }
-    let marker = if active { "▶" } else { " " };
+    let marker = if active { ">" } else { "-" };
     let availability = if path.exists() {
         ""
     } else {
         " [TODO.md not found. Create it with Shift+C]"
     };
-    let border_style = Style::default().fg(if active { Color::Cyan } else { Color::DarkGray });
+    let border_style = Style::default().fg(if active {
+        Color::LightCyan
+    } else {
+        Color::Gray
+    });
+    let completed = todos.iter().filter(|todo| todo.checked).count();
     let search = search_query
         .map(|query| {
             let matches = todos
                 .iter()
                 .filter(|todo| todo_matches_search(todo, Some(query)))
                 .count();
-            format!(" [/{query}: {matches}]")
+            format!("  /{query} ({matches})")
         })
         .unwrap_or_default();
     let list = List::new(items)
         .block(
             Block::default()
                 .title(format!(
-                    " {marker} {name} TODO{availability}{search} ({}) ",
-                    path.display()
+                    " {marker} {name} · {} TODO · {completed} done{search}{availability} ",
+                    todos.len()
                 ))
                 .borders(Borders::ALL)
                 .border_style(border_style),
         )
-        .highlight_symbol("▶ ")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
     let mut state = ListState::default();
     if active && !todos.is_empty() {
         state.select(Some(selected_row));
@@ -1305,13 +1865,21 @@ fn input_cursor(input: &str, width: u16) -> (u16, u16) {
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    let show_inline_input = matches!(
+        app.input_mode,
+        InputMode::Due
+            | InputMode::Category
+            | InputMode::Search
+            | InputMode::ConfirmDelete
+            | InputMode::ConfirmBulkDelete
+    );
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-            Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Length(if show_inline_input { 3 } else { 0 }),
+            Constraint::Length(1),
         ])
         .split(frame.area());
     let (
@@ -1410,22 +1978,39 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     } else {
         &app.input
     };
-    frame.render_widget(
-        Paragraph::new(input_text)
-            .block(Block::default().title(input_title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
-        areas[2],
-    );
+    if show_inline_input {
+        frame.render_widget(
+            Paragraph::new(input_text)
+                .style(Style::default().fg(Color::White))
+                .block(
+                    Block::default()
+                        .title(input_title)
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::LightCyan)),
+                )
+                .wrap(Wrap { trim: false }),
+            areas[2],
+        );
+    }
     let message_style = match app.message_kind {
         MessageKind::Default => Style::default(),
-        MessageKind::Success => Style::default().fg(Color::Green),
-        MessageKind::Warning => Style::default().fg(Color::Yellow),
+        MessageKind::Success => Style::default().fg(Color::LightGreen),
+        MessageKind::Warning => Style::default().fg(Color::LightYellow),
     }
     .add_modifier(Modifier::BOLD);
+    let scope = format!(" {} ", app.scope_name().to_uppercase());
     frame.render_widget(
-        Paragraph::new(app.message.as_str())
-            .style(message_style)
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                scope,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(app.message.as_str(), message_style),
+        ])),
         areas[3],
     );
 
@@ -1461,7 +2046,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     Block::default()
                         .title(title)
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_style(Style::default().fg(Color::LightCyan)),
                 ),
             popup,
         );
@@ -1495,6 +2080,35 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 .wrap(Wrap { trim: false })
                 .block(Block::default().title(" Help ").borders(Borders::ALL)),
             popup,
+        );
+    }
+
+    if app.input_mode == InputMode::AncestorPicker {
+        let area = input_popup_area(frame.area());
+        frame.render_widget(ratatui::widgets::Clear, area);
+        let items = if app.ancestor_candidates.is_empty() {
+            vec![ListItem::new("No ancestor TODO.md found")]
+        } else {
+            app.ancestor_candidates
+                .iter()
+                .map(|(path, selected)| {
+                    let marker = if *selected { "[x]" } else { "[ ]" };
+                    ListItem::new(format!("{marker} {}", path.display()))
+                })
+                .collect()
+        };
+        let mut state = ListState::default();
+        if !app.ancestor_candidates.is_empty() {
+            state.select(Some(app.ancestor_selected));
+        }
+        frame.render_stateful_widget(
+            List::new(items).block(
+                Block::default()
+                    .title(" Shared ancestor TODOs (Space toggle, Enter save) ")
+                    .borders(Borders::ALL),
+            ),
+            area,
+            &mut state,
         );
     }
 }
@@ -1547,6 +2161,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::Char('t') => app.start_due(),
         KeyCode::Char('u') => app.undo()?,
         KeyCode::Char('/') => app.start_search(),
+        KeyCode::Char('-') => app.start_ancestor_picker()?,
         KeyCode::Char('l') | KeyCode::Char('>') | KeyCode::Right => app.change_depth(true)?,
         KeyCode::Char('h') | KeyCode::Char('<') | KeyCode::Left => app.change_depth(false)?,
         KeyCode::Tab => app.toggle_scope()?,
@@ -1585,6 +2200,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
     loop {
         app.update_message_timeout();
         app.update_local_cwd()?;
+        app.refresh_changed_files()?;
         terminal.draw(|frame| draw(frame, app))?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -1622,6 +2238,25 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     app.input_mode = InputMode::Normal;
                 }
             }
+            InputMode::AncestorPicker => match key.code {
+                KeyCode::Esc => app.cancel_input(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.ancestor_selected = app.ancestor_selected.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.ancestor_selected = (app.ancestor_selected + 1)
+                        .min(app.ancestor_candidates.len().saturating_sub(1))
+                }
+                KeyCode::Char(' ') => {
+                    if let Some((_, selected)) =
+                        app.ancestor_candidates.get_mut(app.ancestor_selected)
+                    {
+                        *selected = !*selected;
+                    }
+                }
+                KeyCode::Enter => app.save_ancestor_picker()?,
+                _ => {}
+            },
         }
     }
 }
@@ -1657,7 +2292,7 @@ mod tests {
 
     #[test]
     fn parses_hierarchy_priority_and_due_date() {
-        let todo = parse_todo_line("    - [x] [P1] [SAVE] ship it 📅 2026-07-18").unwrap();
+        let todo = parse_todo_line("    - [x] [P1] [SAVE] ship it 2026-07-18").unwrap();
         assert!(todo.checked);
         assert_eq!(todo.depth, 2);
         assert_eq!(todo.priority, Priority::High);
@@ -1706,6 +2341,7 @@ mod tests {
             due: None,
             saved: false,
             category: category.map(str::to_string),
+            source: None,
         };
         let mut todos = vec![
             make_todo("work low", 0, Priority::Low, Some("work")),
@@ -1741,6 +2377,7 @@ mod tests {
             due: None,
             saved: false,
             category: Some("仕事".into()),
+            source: None,
         };
         assert!(todo_matches_search(&todo, Some("api")));
         assert!(todo_matches_search(&todo, Some("DEPLOY")));
@@ -1776,6 +2413,78 @@ mod tests {
     }
 
     #[test]
+    fn automatically_refreshes_externally_changed_todo_files() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let local = std::env::temp_dir().join(format!("herdr-todo-watch-local-{unique}.md"));
+        let global = std::env::temp_dir().join(format!("herdr-todo-watch-global-{unique}.md"));
+        fs::write(&local, "- [ ] before\n").unwrap();
+        let mut app = App::new(local.clone(), global.clone()).unwrap();
+        app.undo_stack.push(Vec::new());
+
+        fs::write(&local, "- [ ] changed externally\n- [ ] second task\n").unwrap();
+        app.last_file_check = Instant::now() - Duration::from_secs(1);
+        app.refresh_changed_files().unwrap();
+
+        assert_eq!(app.todos.len(), 2);
+        assert_eq!(app.todos[0].text, "changed externally");
+        assert!(app.undo_stack.is_empty());
+        assert_eq!(app.file_stamp, file_stamp(&local));
+
+        fs::remove_file(local).unwrap();
+        fs::remove_file(global).unwrap();
+    }
+
+    #[test]
+    fn loads_descendant_and_selected_ancestor_todos_and_saves_to_sources() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("herdr-todo-tree-{unique}"));
+        let root = base.join("root");
+        let current = root.join("current");
+        let child = current.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(root.join("TODO.md"), "- [ ] ancestor\n").unwrap();
+        fs::write(child.join("TODO.md"), "- [ ] descendant\n").unwrap();
+
+        write_shared_ancestors(&current, &[root.join("TODO.md")]).unwrap();
+        let (mut todos, markdown) = load_local_documents(&current).unwrap();
+        assert!(todos.iter().any(|todo| todo.text == "ancestor"));
+        assert!(todos.iter().any(|todo| todo.text == "descendant"));
+
+        let ancestor = todos
+            .iter_mut()
+            .find(|todo| todo.text == "ancestor")
+            .unwrap();
+        ancestor.checked = true;
+        save_local_documents(&todos, &markdown).unwrap();
+        assert!(
+            fs::read_to_string(root.join("TODO.md"))
+                .unwrap()
+                .contains("- [x] ancestor")
+        );
+        assert!(
+            fs::read_to_string(child.join("TODO.md"))
+                .unwrap()
+                .contains("- [ ] descendant")
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn sorts_siblings_without_detaching_children() {
         let mut todos = vec![
             Todo {
@@ -1786,6 +2495,7 @@ mod tests {
                 due: None,
                 saved: false,
                 category: None,
+                source: None,
             },
             Todo {
                 checked: false,
@@ -1795,6 +2505,7 @@ mod tests {
                 due: None,
                 saved: false,
                 category: None,
+                source: None,
             },
             Todo {
                 checked: false,
@@ -1804,6 +2515,7 @@ mod tests {
                 due: None,
                 saved: false,
                 category: None,
+                source: None,
             },
             Todo {
                 checked: false,
@@ -1813,6 +2525,7 @@ mod tests {
                 due: NaiveDate::from_ymd_opt(2026, 7, 18),
                 saved: false,
                 category: None,
+                source: None,
             },
         ];
         sort_siblings(&mut todos);
@@ -1835,6 +2548,7 @@ mod tests {
             due: None,
             saved: false,
             category: None,
+            source: None,
         };
         let mut todos = vec![
             make_todo("first", 0),
@@ -1904,14 +2618,17 @@ mod tests {
             MarkdownLine {
                 before_todo: 0,
                 text: "| Name | Status |".into(),
+                source: None,
             },
             MarkdownLine {
                 before_todo: 0,
                 text: "| --- | --- |".into(),
+                source: None,
             },
             MarkdownLine {
                 before_todo: 0,
                 text: "| 日本語 | done |".into(),
+                source: None,
             },
         ];
         let rendered = render_table(&markdown.iter().collect::<Vec<_>>(), 40);
@@ -1936,6 +2653,7 @@ mod tests {
                 due: old_due,
                 saved: false,
                 category: None,
+                source: None,
             },
             Todo {
                 checked: false,
@@ -1945,6 +2663,7 @@ mod tests {
                 due: None,
                 saved: true,
                 category: None,
+                source: None,
             },
             Todo {
                 checked: false,
@@ -1954,6 +2673,7 @@ mod tests {
                 due: old_due,
                 saved: true,
                 category: None,
+                source: None,
             },
         ];
         assert_eq!(remove_expired(&mut todos, today), 2);
@@ -1989,25 +2709,57 @@ mod tests {
             due: Some(today),
             saved: false,
             category: None,
+            source: None,
         };
         assert_eq!(
-            todo_style(&todo, today),
+            due_style(&todo, today),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD)
         );
         todo.due = today.checked_sub_days(chrono::Days::new(1));
         assert_eq!(
+            due_style(&todo, today),
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD)
+        );
+        todo.due = None;
+        assert_eq!(priority_style(&todo), Style::default().fg(Color::White));
+        todo.priority = Priority::High;
+        assert_eq!(
+            priority_style(&todo),
+            Style::default()
+                .fg(Color::Rgb(255, 105, 180))
+                .add_modifier(Modifier::BOLD)
+        );
+        todo.priority = Priority::Medium;
+        assert_eq!(
+            priority_style(&todo),
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD)
+        );
+        todo.priority = Priority::Low;
+        assert_eq!(
+            priority_style(&todo),
+            Style::default()
+                .fg(Color::Rgb(173, 255, 47))
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
             todo_style(&todo, today),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Rgb(173, 255, 47))
         );
         todo.checked = true;
         assert_eq!(
             todo_style(&todo, today),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(Color::Gray)
                 .add_modifier(Modifier::CROSSED_OUT)
         );
+        assert_eq!(priority_style(&todo), todo_style(&todo, today));
+        assert_eq!(due_style(&todo, today), todo_style(&todo, today));
     }
 
     #[test]
