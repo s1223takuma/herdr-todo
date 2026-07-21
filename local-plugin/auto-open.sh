@@ -41,7 +41,7 @@ source_cwd=$(printf '%s\n' "$panes_json" \
         '.result.panes[] | select(.pane_id == $pane) | .foreground_cwd // .cwd // empty')
 [ -n "$source_cwd" ] || source_cwd=$PWD
 
-exec "$HERDR_CMD" plugin pane open \
+open_output=$("$HERDR_CMD" plugin pane open \
     --plugin herdr-todo \
     --entrypoint todo \
     --placement split \
@@ -49,4 +49,29 @@ exec "$HERDR_CMD" plugin pane open \
     --target-pane "$source_pane_id" \
     --cwd "$source_cwd" \
     --env "HERDR_TODO_SOURCE_PANE_ID=$source_pane_id" \
-    --no-focus
+    --no-focus)
+printf '%s\n' "$open_output"
+
+# Keep automatically opened panes at the same 65/35 ratio as normal launches.
+todo_pane_id=$(printf '%s\n' "$open_output" \
+    | jq -r '.result.plugin_pane.pane.pane_id // empty' 2>/dev/null)
+if [ -n "$todo_pane_id" ]; then
+    layout_json=$($HERDR_CMD pane layout --pane "$todo_pane_id" 2>/dev/null || true)
+    current_ratio=$(printf '%s\n' "$layout_json" \
+        | jq -r '(.result.layout.splits[] | select(.id == "split_0_root") | .ratio) // empty' \
+            2>/dev/null)
+    if [ -n "$current_ratio" ]; then
+        adjustment=$(awk -v current="$current_ratio" 'BEGIN {
+            delta = 0.65 - current
+            if (delta > 0.001) printf "right %.6f", delta
+            else if (delta < -0.001) printf "left %.6f", -delta
+        }')
+        if [ -n "$adjustment" ]; then
+            set -- $adjustment
+            $HERDR_CMD pane resize \
+                --direction "$1" \
+                --amount "$2" \
+                --pane "$todo_pane_id" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
