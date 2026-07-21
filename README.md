@@ -86,6 +86,12 @@ key = "prefix+t"
 type = "plugin_action"
 command = "herdr-todo.open"
 description = "Open TODO"
+
+[[keys.command]]
+key = "prefix+alt+t"
+type = "plugin_action"
+command = "herdr-todo.restart-all"
+description = "Restart TODOs in all workspaces"
 ```
 
 設定後はHerdrを再起動するか、次のコマンドで再読み込みします。
@@ -171,7 +177,7 @@ TODOの追加・編集はポップアップで行います。`Shift+Enter`また
 
 Localの`TODO.md`は起動時に自動作成されません。存在しない場合はLocal画面に案内が表示され、`Shift+C`で新規作成できます。既存ファイルは上書きしません。
 
-Local画面には現在ディレクトリと3階層目までの子孫ディレクトリにある`TODO.md`が表示されます。`v`で子孫分を展開／折りたたみでき、折りたたみ中も現在ディレクトリと共有祖先のTODOは表示されます。各TODOの先頭には保存元のディレクトリ名が付き、編集は元のファイルへ保存されます。`.git`、`target`、`node_modules`内は探索しません。
+Local画面の子孫ディレクトリにある`TODO.md`はデフォルトでは折りたたまれています。`v`で3階層目までの子孫分を展開／折りたたみでき、その状態は現在ディレクトリの`.herdr-todo.toml`に保存され、同じディレクトリを表示するTODOペイン間で共有されます。折りたたみ中も現在ディレクトリと共有祖先のTODOは表示されます。各TODOの先頭には保存元のディレクトリ名が付き、編集は元のファイルへ保存されます。`.git`、`target`、`node_modules`内は探索しません。
 
 祖先ディレクトリの`TODO.md`も表示するには、Localを選択して`-`を押します。`j/k`で移動し、Spaceで共有を切り替え、Enterで確定します。選択結果は現在ディレクトリの`.herdr-todo.toml`へ保存されます。
 
@@ -365,6 +371,12 @@ key = "prefix+t"
 type = "plugin_action"
 command = "herdr-todo.open"
 description = "Open TODO"
+
+[[keys.command]]
+key = "prefix+alt+t"
+type = "plugin_action"
+command = "herdr-todo.restart-all"
+description = "Restart TODOs in all workspaces"
 ```
 
 Restart Herdr after editing the file, or reload the configuration:
@@ -450,7 +462,7 @@ Deleting a parent also deletes all of its children.
 
 The Local `TODO.md` is not created automatically. When it is missing, the Local section displays a notice. Press `Shift+C` to create it. An existing file is never overwritten by this command.
 
-The Local pane combines `TODO.md` files in the current directory and descendants up to three levels deep. Press `v` to expand or collapse descendant TODOs; the current directory and shared ancestors remain visible while collapsed. Each TODO is prefixed with its source directory, and edits are written back to that source file. Directories named `.git`, `target`, and `node_modules` are skipped.
+Descendant `TODO.md` files are collapsed by default in the Local pane. Press `v` to expand or collapse descendants up to three levels deep. The state is saved in `.herdr-todo.toml` in the current directory and shared by TODO panes displaying that directory. The current directory and shared ancestors remain visible while collapsed. Each TODO is prefixed with its source directory, and edits are written back to that source file. Directories named `.git`, `target`, and `node_modules` are skipped.
 
 To include ancestor `TODO.md` files, select Local and press `-`. Move with `j/k`, toggle sharing with Space, and save with Enter. The selection is persisted in `.herdr-todo.toml` in the current directory.
 

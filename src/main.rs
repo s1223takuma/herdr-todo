@@ -159,7 +159,7 @@ impl App {
     fn new(local_path: PathBuf, global_path: PathBuf) -> Result<Self> {
         ensure_todo_file(&global_path)?;
         let local_root = local_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let descendants_expanded = true;
+        let descendants_expanded = read_descendants_expanded(&local_root)?;
         let (todos, markdown) = load_local_view(&local_root, &local_path, descendants_expanded)?;
         let (other_todos, other_markdown) = load_document(&global_path)?;
         let local_stamp = local_view_stamp(&local_root, &local_path, descendants_expanded);
@@ -195,7 +195,8 @@ impl App {
             ancestor_candidates: Vec::new(),
             ancestor_selected: 0,
             descendants_expanded,
-            cmd_shift_q_quit: option_env!("HERDR_TODO_QUIT_KEY") == Some("cmd-shift-q"),
+            cmd_shift_q_quit: option_env!("HERDR_TODO_QUIT_KEY") == Some("cmd-shift-q")
+                || env::var("HERDR_TODO_QUIT_KEY").as_deref() == Ok("cmd-shift-q"),
         })
     }
 
@@ -360,6 +361,7 @@ impl App {
             return Ok(());
         }
         self.descendants_expanded = !self.descendants_expanded;
+        write_descendants_expanded(&self.local_root, self.descendants_expanded)?;
         self.reload_local()?;
         self.file_stamp = local_view_stamp(
             &self.local_root,
@@ -849,6 +851,15 @@ impl App {
         }
         self.last_file_check = Instant::now();
         let mut refreshed = false;
+        let configured_descendants_expanded = read_descendants_expanded(&self.local_root)?;
+        if configured_descendants_expanded != self.descendants_expanded {
+            self.descendants_expanded = configured_descendants_expanded;
+            if self.scope == Scope::Local {
+                self.file_stamp = None;
+            } else {
+                self.other_file_stamp = None;
+            }
+        }
 
         let current_stamp = if self.scope == Scope::Local {
             local_view_stamp(
@@ -955,10 +966,12 @@ impl App {
         if new_path == self.local_path {
             return Ok(());
         }
-        let (todos, markdown) = load_local_view(&cwd, &new_path, self.descendants_expanded)?;
-        let new_stamp = local_view_stamp(&cwd, &new_path, self.descendants_expanded);
+        let descendants_expanded = read_descendants_expanded(&cwd)?;
+        let (todos, markdown) = load_local_view(&cwd, &new_path, descendants_expanded)?;
+        let new_stamp = local_view_stamp(&cwd, &new_path, descendants_expanded);
         self.local_path = new_path;
         self.local_root = cwd.clone();
+        self.descendants_expanded = descendants_expanded;
         if self.scope == Scope::Local {
             self.todos = todos;
             self.markdown = markdown;
@@ -1013,7 +1026,8 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
 }
 
 fn local_tree_stamp(root: &Path, include_descendants: bool) -> Option<FileStamp> {
-    let paths = local_todo_paths(root, include_descendants).ok()?;
+    let mut paths = local_todo_paths(root, include_descendants).ok()?;
+    paths.push(config_path(root));
     let mut modified = None;
     let mut len = 0_u64;
     for path in paths {
@@ -1081,6 +1095,20 @@ fn config_path(root: &Path) -> PathBuf {
     root.join(".herdr-todo.toml")
 }
 
+fn read_descendants_expanded(root: &Path) -> Result<bool> {
+    let path = config_path(root);
+    let Ok(content) = fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    Ok(content
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "descendants_expanded").then(|| value.trim() == "true")
+        })
+        .unwrap_or(false))
+}
+
 fn read_shared_ancestors(root: &Path) -> Result<Vec<PathBuf>> {
     let path = config_path(root);
     let Ok(content) = fs::read_to_string(&path) else {
@@ -1097,6 +1125,16 @@ fn read_shared_ancestors(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn write_shared_ancestors(root: &Path, paths: &[PathBuf]) -> Result<()> {
+    let descendants_expanded = read_descendants_expanded(root)?;
+    write_local_config(root, paths, descendants_expanded)
+}
+
+fn write_descendants_expanded(root: &Path, expanded: bool) -> Result<()> {
+    let shared_ancestors = read_shared_ancestors(root)?;
+    write_local_config(root, &shared_ancestors, expanded)
+}
+
+fn write_local_config(root: &Path, paths: &[PathBuf], descendants_expanded: bool) -> Result<()> {
     let mut output = String::from("# Managed by Herdr TODO\nshared_ancestors = [\n");
     for path in paths {
         let relative = path
@@ -1106,6 +1144,7 @@ fn write_shared_ancestors(root: &Path, paths: &[PathBuf]) -> Result<()> {
         output.push_str(&format!("  \"{}\",\n", relative.display()));
     }
     output.push_str("]\n");
+    output.push_str(&format!("descendants_expanded = {descendants_expanded}\n"));
     fs::write(config_path(root), output).context("failed to save .herdr-todo.toml")
 }
 
@@ -2686,6 +2725,37 @@ mod tests {
                 .map(|todo| todo.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["root"]
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn descendant_visibility_defaults_to_collapsed_and_is_saved_per_directory() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("herdr-todo-config-{unique}"));
+        let first = base.join("first");
+        let second = base.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+
+        assert!(!read_descendants_expanded(&first).unwrap());
+        write_descendants_expanded(&first, true).unwrap();
+        assert!(read_descendants_expanded(&first).unwrap());
+        assert!(!read_descendants_expanded(&second).unwrap());
+
+        write_shared_ancestors(&first, &[base.join("TODO.md")]).unwrap();
+        assert!(read_descendants_expanded(&first).unwrap());
+        assert_eq!(
+            read_shared_ancestors(&first).unwrap(),
+            vec![base.join("TODO.md")]
         );
 
         fs::remove_dir_all(base).unwrap();

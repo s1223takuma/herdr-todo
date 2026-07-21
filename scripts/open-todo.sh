@@ -58,7 +58,7 @@ fi
 open_output=$("$@")
 printf '%s\n' "$open_output"
 
-# Plugin split defaults can vary between 50/50 and 65/35 depending on when the
+# Plugin split defaults can vary depending on when the
 # action runs. Normalize normal launches to the auto-open workspace ratio.
 if command -v jq >/dev/null 2>&1; then
     todo_pane_id=$(printf '%s\n' "$open_output" \

@@ -12,7 +12,7 @@ placement = "split"
 command = [
   "sh",
   "-c",
-  "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-todo\""
+  "HERDR_TODO_QUIT_KEY=cmd-shift-q exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-todo\""
 ]
 
 [[actions]]
